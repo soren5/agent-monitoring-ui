@@ -19,6 +19,7 @@ import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 import { startUsageReaderBridge, stopUsageReaderBridge } from './usage-reader-bridge.js';
+import { startMonitorRuntime, stopMonitorRuntime } from './monitor/runtime.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -164,6 +165,9 @@ async function main(): Promise<void> {
   // 7. Start the `ncl` CLI socket server (data/ncl.sock).
   await startCliServer();
 
+  // 7b. Authenticated, owner-only local monitoring stream.
+  await startMonitorRuntime();
+
   // 8. Host-only, fixed-function bridge to the separately authorized usage
   // reader. A failure leaves NanoClaw running; Codex usage jobs fail closed
   // with the bridge error rather than silently using aggregate account data.
@@ -190,6 +194,7 @@ async function shutdown(signal: string): Promise<void> {
   stopHostSweep();
   stopCodexAuthSync();
   await stopCliServer();
+  await stopMonitorRuntime();
   await stopUsageReaderBridge().catch((err) => log.error('Usage reader bridge shutdown failed', { err }));
   try {
     await teardownChannelAdapters();

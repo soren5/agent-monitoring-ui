@@ -59,6 +59,7 @@ function seedConfig(provider = 'codex', model: string | null = null): void {
     additional_mounts: JSON.stringify([]),
     cli_scope: 'group',
     timezone: null,
+    harness: null,
     updated_at: new Date().toISOString(),
   });
 }

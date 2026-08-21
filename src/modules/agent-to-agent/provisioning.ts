@@ -32,6 +32,8 @@ import { getAgentTemplate, templateRevision } from './agent-templates.js';
 import { delegateGrant, findEffectiveGrant, issueRootGrant } from './capabilities.js';
 import { createDestination, getDestinationByName, normalizeName } from './db/agent-destinations.js';
 import { createRelation, getLiveRelation, removeRelationSubtree } from './relations.js';
+import { log } from '../../log.js';
+import { ensureChildWorktree, ensureWorktreesAllowlisted, mountChildWorktree } from './repository-worktree.js';
 import { writeDestinations } from './write-destinations.js';
 import { probeLocalModel } from './local-model-health.js';
 import { createProjectInTransaction } from './projects.js';
@@ -92,6 +94,20 @@ type ProjectRow = {
 };
 
 const now = () => new Date().toISOString();
+
+/**
+ * Resolve the default-branch HEAD SHA for a repository, used as the base for an
+ * isolated child worktree. Reads from the local worktree source (the
+ * consolidated single repo) so it matches what `ensureChildWorktree` will pin.
+ */
+function defaultBranchSha(repositoryId: string): string {
+  const { repositorySource } = require('./repository-worktree.js') as {
+    repositorySource: (repositoryId: string) => string;
+  };
+  const source = repositorySource(repositoryId);
+  const { execFileSync } = require('child_process') as typeof import('child_process');
+  return execFileSync('git', ['-C', source, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+}
 const hash = (v: unknown) => crypto.createHash('sha256').update(JSON.stringify(v)).digest('hex');
 
 function audit(requestId: string | null, caller: string, operation: string, outcome: string, request: unknown): void {
@@ -448,7 +464,11 @@ async function materialize(request: ProvisionRow, session: Session, approvalId: 
         instructions: `${template.instructionBase}\n\n${request.instruction_overlay}`.trim(),
         provider: template.provider,
       });
-      updateContainerConfigScalars(groupId, { model: template.allowedModels[0], cli_scope: 'disabled' });
+      updateContainerConfigScalars(groupId, {
+        model: template.allowedModels[0],
+        cli_scope: 'disabled',
+        harness: template.harness ?? 'read-only',
+      });
       const bootstrapProject = request.project_bootstrap_id
         ? createProjectInTransaction(request.project_bootstrap_id, groupId, request.platform_id!)
         : undefined;
@@ -517,14 +537,16 @@ async function materialize(request: ProvisionRow, session: Session, approvalId: 
         const rootParent = !getLiveRelation(parent.id);
         const parentPrefixes = new Map<string, string>();
         for (const action of template.repositoryActions) {
-          const parentGrant = rootParent
-            ? undefined
-            : findEffectiveGrant(parent.id, {
-                resourceType: 'repository',
-                resourceId: request.repository_id,
-                action,
-              });
-          if (!rootParent && !parentGrant) throw new Error(`Parent lacks repository ${action} authority.`);
+          // A parent's repository authority comes from its own grants,
+          // whether it is a root or a descendant. A root with explicit grants
+          // (e.g. an owner-granted implementation prefix) delegates that exact
+          // prefix to its children; a root or descendant without them falls
+          // back to a derived per-child namespace.
+          const parentGrant = findEffectiveGrant(parent.id, {
+            resourceType: 'repository',
+            resourceId: request.repository_id,
+            action,
+          });
           const constraints = parentGrant ? (JSON.parse(parentGrant.constraints_json) as Record<string, unknown>) : {};
           const parentPrefix =
             action === 'pr-create'
@@ -536,7 +558,8 @@ async function materialize(request: ProvisionRow, session: Session, approvalId: 
                 : null;
           const prefix = parentPrefix ?? `nanoclaw/${groupId}/`;
           // A nested child must be strictly narrower than its parent's branch
-          // namespace; roots derive their own owner-approved namespace.
+          // namespace; a root without grants derives its own namespace, and a
+          // root WITH grants passes its exact prefix down unchanged.
           const childPrefix = rootParent ? prefix : `${prefix}${groupId}/`;
           parentPrefixes.set(action, childPrefix);
           const capability = {
@@ -564,6 +587,24 @@ async function materialize(request: ProvisionRow, session: Session, approvalId: 
             request.request_id,
             createdAt,
           );
+        // Provision an isolated writable worktree for the child. Pinned to the
+        // repository's default-branch HEAD at materialization time (the
+        // consolidated base); the child's dispatch pins the exact task base.
+        // Non-fatal on infrastructure failure (e.g. worktree source missing):
+        // the agent + grants still materialize, and the operator can add the
+        // checkout out-of-band. The repo profile records intent regardless.
+        try {
+          ensureWorktreesAllowlisted();
+          const baseSha = defaultBranchSha(request.repository_id);
+          const worktreePath = ensureChildWorktree(groupId, request.repository_id, baseSha);
+          mountChildWorktree(groupId, worktreePath);
+        } catch (err) {
+          log.warn('Isolated worktree provisioning failed; agent materialized without a local checkout', {
+            agentGroupId: groupId,
+            repositoryId: request.repository_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
       for (const action of JSON.parse(request.requested_actions_json) as string[]) {
         // The owner approval is the root authority; each operation is still

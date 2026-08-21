@@ -4,7 +4,7 @@ import crypto from 'crypto';
 export type AgentTemplate = {
   id: string;
   version: string;
-  provider: 'codex' | 'openai-compatible';
+  provider: 'codex' | 'deepseek' | 'opencode' | 'openai-compatible';
   allowedModels: readonly string[];
   capabilityActions: readonly string[];
   maxDescendantDepth: number;
@@ -13,6 +13,12 @@ export type AgentTemplate = {
   repositoryActions: readonly ('read' | 'branch-write' | 'pr-create' | 'pr-merge')[];
   mergePolicy: 'disabled' | 'parent-review' | 'automated-checks';
   instructionBase: string;
+  /**
+   * Harness tool surface for harness-backed providers (opencode/codex):
+   * `'implementation'` gives the coding agent shell + filesystem access to its
+   * isolated checkout. Omitted/`'read-only'` for non-implementation roles.
+   */
+  harness?: 'read-only' | 'implementation';
 };
 
 const localModels = ['google/gemma-4-12b-qat', 'qwen/qwen3.6-27b'] as const;
@@ -42,18 +48,41 @@ const templates: Record<string, AgentTemplate> = {
     mergePolicy: 'parent-review',
     instructionBase: 'You are a project requirements parent. Create and manage only approved, constrained descendants.',
   },
-  api: {
-    id: 'api',
+  codex: {
+    id: 'codex',
     version: '1',
-    provider: 'openai-compatible',
-    allowedModels: localModels,
+    provider: 'codex',
+    // Empty model = codex default (the ChatGPT/OpenAI account's available
+    // model). Codex is a harness-backed API backend — never a local model.
+    allowedModels: [],
     capabilityActions: ['dispatch-child', 'activate-child', 'get-status', 'run-smoke-test'],
     maxDescendantDepth: 2,
     channelModes: ['project-report', 'project-alias'],
     smokeTestId: 'basic-agent-message',
     repositoryActions: repositoryCoding,
     mergePolicy: 'disabled',
-    instructionBase: 'You are a constrained API implementation agent. Work only within your assigned project scope.',
+    harness: 'implementation',
+    instructionBase:
+      'You are a constrained Codex-backed implementation agent. Work only within your assigned project scope.',
+  },
+  deepseek: {
+    id: 'deepseek',
+    version: '1',
+    // DeepSeek rides the opencode harness (read/bash/edit/write + agentic
+    // loop), which maps deepseek-v4-flash to the DeepSeek API via the gateway
+    // proxy. This gives the agent a real tool surface — shell, git, build,
+    // test — against its isolated checkout, never a bare chat client.
+    provider: 'opencode',
+    allowedModels: ['deepseek-v4-flash'],
+    capabilityActions: ['dispatch-child', 'activate-child', 'get-status', 'run-smoke-test'],
+    maxDescendantDepth: 2,
+    channelModes: ['project-report', 'project-alias'],
+    smokeTestId: 'basic-agent-message',
+    repositoryActions: repositoryCoding,
+    mergePolicy: 'disabled',
+    harness: 'implementation',
+    instructionBase:
+      'You are a constrained DeepSeek-backed implementation agent. Work only within your assigned project scope.',
   },
   junior: {
     id: 'junior',

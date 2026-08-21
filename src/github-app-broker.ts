@@ -99,28 +99,16 @@ export async function createFeatureBranch(
     resourceType: 'repository',
     resourceId: repository,
     action: 'branch-write',
-    constraints: { branch_prefix: branch },
   });
   const prefix = grant && (JSON.parse(grant.constraints_json) as { branch_prefix?: unknown }).branch_prefix;
   if (!grant || typeof prefix !== 'string' || !branch.startsWith(prefix))
     throw new Error(`Capability denied: branch is outside the granted prefix.`);
   const [owner, name] = parseRepository(repository);
-  // The base may be a branch name (refs/heads/<base>) or a commit SHA. Try the
-  // branch ref first; on 404 fall back to resolving the SHA directly so a task
-  // can branch from an exact pinned commit.
-  let sha: string | undefined;
   const baseRef = await github(`/repos/${owner}/${name}/git/ref/heads/${encodeURIComponent(base)}`);
-  if (baseRef.ok) {
-    const baseBody = (await baseRef.json()) as { object?: { sha?: string } };
-    sha = baseBody.object?.sha;
-  } else if (baseRef.status === 404) {
-    const commit = await github(`/repos/${owner}/${name}/commits/${encodeURIComponent(base)}`);
-    if (commit.ok) {
-      const commitBody = (await commit.json()) as { sha?: string };
-      sha = commitBody.sha;
-    }
-  }
-  if (!sha) throw new Error(`GitHub base ref read failed (${baseRef.status}).`);
+  if (!baseRef.ok) throw new Error(`GitHub base ref read failed (${baseRef.status}).`);
+  const baseBody = (await baseRef.json()) as { object?: { sha?: string } };
+  const sha = baseBody.object?.sha;
+  if (!sha) throw new Error('GitHub base ref response was incomplete.');
   const created = await github(`/repos/${owner}/${name}/git/refs`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -143,7 +131,6 @@ export async function createPullRequest(
     resourceType: 'repository',
     resourceId: repository,
     action: 'pr-create',
-    constraints: { head_prefix: head },
   });
   const prefix = grant && (JSON.parse(grant.constraints_json) as { head_prefix?: unknown }).head_prefix;
   if (!grant || typeof prefix !== 'string' || !head.startsWith(prefix))
@@ -173,18 +160,17 @@ export async function mergePullRequest(
   pullNumber: number,
 ): Promise<{ merged: boolean; sha: string | null }> {
   if (!Number.isInteger(pullNumber) || pullNumber <= 0) throw new Error('Pull-request number is invalid.');
-  const [owner, name] = parseRepository(repository);
-  const pull = await github(`/repos/${owner}/${name}/pulls/${pullNumber}`);
-  if (!pull.ok) throw new Error(`GitHub pull-request read failed (${pull.status}).`);
-  const details = (await pull.json()) as { state?: string; merged?: boolean; head?: { ref?: string } };
   const grant = findEffectiveGrant(subjectAgentGroupId, {
     resourceType: 'repository',
     resourceId: repository,
     action: 'pr-merge',
-    constraints: { branch_prefix: details.head?.ref ?? '' },
   });
   const prefix = grant && (JSON.parse(grant.constraints_json) as { branch_prefix?: unknown }).branch_prefix;
   if (!grant || typeof prefix !== 'string') throw new Error('Capability denied: pull-request merge is not granted.');
+  const [owner, name] = parseRepository(repository);
+  const pull = await github(`/repos/${owner}/${name}/pulls/${pullNumber}`);
+  if (!pull.ok) throw new Error(`GitHub pull-request read failed (${pull.status}).`);
+  const details = (await pull.json()) as { state?: string; merged?: boolean; head?: { ref?: string } };
   if (details.state !== 'open' || details.merged || !details.head?.ref?.startsWith(prefix))
     throw new Error('Pull request is not an open delegated descendant branch.');
   const merged = await github(`/repos/${owner}/${name}/pulls/${pullNumber}/merge`, {
@@ -219,7 +205,6 @@ export async function writeRepositoryFile(
     resourceType: 'repository',
     resourceId: repository,
     action: 'branch-write',
-    constraints: { branch_prefix: branch },
   });
   const prefix = grant && (JSON.parse(grant.constraints_json) as { branch_prefix?: unknown }).branch_prefix;
   if (!grant || typeof prefix !== 'string' || !branch.startsWith(prefix))

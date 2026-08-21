@@ -13,7 +13,7 @@ describe('project-channel factory routing state', () => {
   beforeEach(() => {
     runMigrations(initTestDb());
     addGroup('requirements');
-    addGroup('api');
+    addGroup('codex');
     addGroup('junior');
   });
   afterEach(closeDb);
@@ -37,16 +37,16 @@ describe('project-channel factory routing state', () => {
     const insert = getDb().prepare(
       `INSERT INTO project_agents
        (project_id, agent_group_id, parent_agent_group_id, role_id, alias, parent_local_name, child_parent_local_name, report_destination_local_name, created_at)
-       VALUES (?, ?, 'requirements', 'api', ?, ?, 'parent', 'project', ?)`,
+       VALUES (?, ?, 'requirements', 'codex', ?, ?, 'parent', 'project', ?)`,
     );
-    insert.run(project.project_id, 'api', 'api', 'api', now());
+    insert.run(project.project_id, 'codex', 'codex', 'codex', now());
     insert.run(project.project_id, 'junior', 'junior', 'junior', now());
 
     expect(resolveProjectRecipient(project.messaging_group_id, 'ordinary intake', 'thread-1')).toBeUndefined();
-    expect(resolveProjectRecipient(project.messaging_group_id, '@api implement endpoint', 'thread-1')).toBe('api');
+    expect(resolveProjectRecipient(project.messaging_group_id, '@codex implement endpoint', 'thread-1')).toBe('codex');
     // A bound thread stays with the addressed child; it does not fan out or
     // jump to the other child merely because another alias appears later.
-    expect(resolveProjectRecipient(project.messaging_group_id, '@junior follow-up', 'thread-1')).toBe('api');
+    expect(resolveProjectRecipient(project.messaging_group_id, '@junior follow-up', 'thread-1')).toBe('codex');
     expect(resolveProjectRecipient(project.messaging_group_id, '@junior separate thread', 'thread-2')).toBe('junior');
   });
 });

@@ -31,6 +31,8 @@ import { migration029 } from './029-repository-audit-events.js';
 import { migration030 } from './030-provisioning-project-bootstrap.js';
 import { migration031 } from './031-agent-smoke-challenge.js';
 import { migration032 } from './032-provider-migrations.js';
+import { migration033 } from './033-container-config-harness.js';
+import { migration034 } from './034-monitor-commands.js';
 
 export interface Migration {
   version: number;
@@ -78,6 +80,8 @@ export const migrations: Migration[] = [
   migration030,
   migration031,
   migration032,
+  migration033,
+  migration034,
 ];
 
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a

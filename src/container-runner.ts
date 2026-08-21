@@ -34,6 +34,7 @@ import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { emitRuntimeTelemetry } from './monitor/telemetry.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
@@ -160,6 +161,7 @@ async function spawnContainer(session: Session): Promise<void> {
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
+  emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'starting', hasBlockers: false });
 
   // Clear any orphan heartbeat from a previous container instance — the
   // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
@@ -171,6 +173,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   activeContainers.set(session.id, { process: container, containerName });
   markContainerRunning(session.id);
+  emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'in_progress', hasBlockers: false });
 
   // Log stderr. A container that dies at boot (unknown provider, missing
   // binary, bad config) explains itself only here — and debug is below the
@@ -199,8 +202,11 @@ async function spawnContainer(session: Session): Promise<void> {
     stopTypingRefresh(session.id);
     // code null = killed by signal (normal shutdown path), not a boot failure.
     if (code !== 0 && code !== null && stderrTail.length > 0) {
+      emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'failed', hasBlockers: false });
+      emitRuntimeTelemetry('error', agentGroup.id, { message: 'container_exited_nonzero', code });
       log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });
     } else {
+      emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'stopped', hasBlockers: false });
       log.info('Container exited', { sessionId: session.id, code, containerName });
     }
   });
@@ -210,6 +216,8 @@ async function spawnContainer(session: Session): Promise<void> {
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     log.error('Container spawn error', { sessionId: session.id, err });
+    emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'failed', hasBlockers: false });
+    emitRuntimeTelemetry('error', agentGroup.id, { message: err.message });
   });
 }
 

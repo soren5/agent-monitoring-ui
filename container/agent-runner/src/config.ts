@@ -20,6 +20,12 @@ export interface RunnerConfig {
   model?: string;
   effort?: string;
   agentHooks?: AgentHooksConfig;
+  /**
+   * Harness tool surface for opencode-backed agents: `'read-only'` (default)
+   * or `'implementation'`. Set per-group via container.json for provisioned
+   * coding agents that must build/test against an isolated checkout.
+   */
+  harness?: 'read-only' | 'implementation';
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -50,6 +56,7 @@ export function loadConfig(): RunnerConfig {
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,
     agentHooks: readAgentHooks(raw),
+    harness: raw.harness === 'implementation' ? 'implementation' : 'read-only',
   };
 
   return _config;

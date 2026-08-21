@@ -60,6 +60,12 @@ export const SENDER_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+// Host-owned root for isolated per-agent repository worktrees. Each provisioned
+// child with a repository_id gets its own writable checkout under a child-named
+// subdirectory, mounted into the container at /workspace/extra/repo.
+export const WORKTREES_DIR = process.env.NANOCLAW_WORKTREES_DIR
+  ? path.resolve(process.env.NANOCLAW_WORKTREES_DIR)
+  : path.resolve(PROJECT_ROOT, '..', 'nanoclaw-worktrees');
 // Local agent-template library. Committed but ships empty (+ README). Resolved
 // once at load. Override to another LOCAL path via NANOCLAW_TEMPLATES_DIR; never
 // a remote URL, never an ncl flag, never runtime-mutable.
