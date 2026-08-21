@@ -99,6 +99,7 @@ export async function createFeatureBranch(
     resourceType: 'repository',
     resourceId: repository,
     action: 'branch-write',
+    constraints: { branch_prefix: branch },
   });
   const prefix = grant && (JSON.parse(grant.constraints_json) as { branch_prefix?: unknown }).branch_prefix;
   if (!grant || typeof prefix !== 'string' || !branch.startsWith(prefix))
@@ -131,6 +132,7 @@ export async function createPullRequest(
     resourceType: 'repository',
     resourceId: repository,
     action: 'pr-create',
+    constraints: { head_prefix: head },
   });
   const prefix = grant && (JSON.parse(grant.constraints_json) as { head_prefix?: unknown }).head_prefix;
   if (!grant || typeof prefix !== 'string' || !head.startsWith(prefix))
@@ -160,17 +162,18 @@ export async function mergePullRequest(
   pullNumber: number,
 ): Promise<{ merged: boolean; sha: string | null }> {
   if (!Number.isInteger(pullNumber) || pullNumber <= 0) throw new Error('Pull-request number is invalid.');
-  const grant = findEffectiveGrant(subjectAgentGroupId, {
-    resourceType: 'repository',
-    resourceId: repository,
-    action: 'pr-merge',
-  });
-  const prefix = grant && (JSON.parse(grant.constraints_json) as { branch_prefix?: unknown }).branch_prefix;
-  if (!grant || typeof prefix !== 'string') throw new Error('Capability denied: pull-request merge is not granted.');
   const [owner, name] = parseRepository(repository);
   const pull = await github(`/repos/${owner}/${name}/pulls/${pullNumber}`);
   if (!pull.ok) throw new Error(`GitHub pull-request read failed (${pull.status}).`);
   const details = (await pull.json()) as { state?: string; merged?: boolean; head?: { ref?: string } };
+  const grant = findEffectiveGrant(subjectAgentGroupId, {
+    resourceType: 'repository',
+    resourceId: repository,
+    action: 'pr-merge',
+    constraints: { branch_prefix: details.head?.ref ?? '' },
+  });
+  const prefix = grant && (JSON.parse(grant.constraints_json) as { branch_prefix?: unknown }).branch_prefix;
+  if (!grant || typeof prefix !== 'string') throw new Error('Capability denied: pull-request merge is not granted.');
   if (details.state !== 'open' || details.merged || !details.head?.ref?.startsWith(prefix))
     throw new Error('Pull request is not an open delegated descendant branch.');
   const merged = await github(`/repos/${owner}/${name}/pulls/${pullNumber}/merge`, {
@@ -205,6 +208,7 @@ export async function writeRepositoryFile(
     resourceType: 'repository',
     resourceId: repository,
     action: 'branch-write',
+    constraints: { branch_prefix: branch },
   });
   const prefix = grant && (JSON.parse(grant.constraints_json) as { branch_prefix?: unknown }).branch_prefix;
   if (!grant || typeof prefix !== 'string' || !branch.startsWith(prefix))
