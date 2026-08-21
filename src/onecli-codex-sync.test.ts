@@ -40,6 +40,7 @@ vi.mock('os', async () => {
 
 vi.mock('./log.js', () => ({
   log: {
+    debug: vi.fn(),
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
