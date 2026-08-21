@@ -1,8 +1,8 @@
 import type { Migration } from './index.js';
 
 /** Durable idempotency outcomes for local monitor message commands. */
-export const migration033: Migration = {
-  version: 33,
+export const migration034: Migration = {
+  version: 34,
   name: 'monitor-command-outcomes',
   up(db) {
     db.exec(`
