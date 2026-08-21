@@ -525,7 +525,10 @@ describe('task-run turn wiring (real processQuery)', () => {
       // A SECOND task run lands while the query is open — the follow-up poller
       // pushes it and must reset the per-turn correction state.
       insertMessage('t2', 'task', { prompt: 'fire two' });
-      const deadline = Date.now() + 5000;
+      // Generous window: the follow-up poller must observe the new row and push
+      // it into the open query. Under slow CI runners 5s was too tight and the
+      // push arrived after the deadline, timing the test out.
+      const deadline = Date.now() + 15000;
       while (!pushes.some((p) => p.includes('fire two')) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 50));
       }

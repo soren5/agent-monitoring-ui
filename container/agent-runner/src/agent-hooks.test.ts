@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import {
@@ -178,7 +179,10 @@ JSON`,
   });
 
   it('archives agent calls and responses to a JSONL file', async () => {
-    const tmp = fs.mkdtempSync(path.join('/workspace/agent', 'agent-call-archive-'));
+    // /workspace/agent is the container path and may not exist (or be writable)
+    // outside a container — point the archive root at a unique temp subdir.
+    const tmp = path.join(os.tmpdir(), `agent-call-archive-${Date.now()}`);
+    process.env.NANOCLAW_AGENT_CALL_ARCHIVE_ROOT = tmp;
     const archivePath = path.join(tmp, 'calls.jsonl');
     const hooks: AgentHooksConfig = {
       before_agent_call: [
@@ -225,6 +229,7 @@ JSON`,
     expect(records.map((record) => record.phase)).toEqual(['before_agent_call', 'after_agent_call']);
     expect((records[0].request as { prompt: string }).prompt).toBe('hello');
     expect((records[1].response as { messages: Array<{ text: string }> }).messages[0].text).toContain('hi');
+    delete process.env.NANOCLAW_AGENT_CALL_ARCHIVE_ROOT;
   });
 
   it('adds default archive hooks without removing configured hooks', () => {
