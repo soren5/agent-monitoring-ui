@@ -45,6 +45,8 @@ export interface ContainerConfig {
   model?: string;
   effort?: string;
   timezone?: string;
+  /** Harness tool surface for harness-backed providers ('read-only'|'implementation'). */
+  harness?: 'read-only' | 'implementation';
 }
 
 /**
@@ -77,6 +79,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
+    harness: row.harness === 'implementation' ? 'implementation' : 'read-only',
   };
 }
 

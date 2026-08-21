@@ -82,6 +82,15 @@ export interface ProviderOptions {
    * through to the underlying SDK. If omitted, the SDK default is used.
    */
   effort?: string;
+  /**
+   * Harness tool surface. `'read-only'` (default) restricts the harness to
+   * inspection (read/bash-ls/cat/etc.) — the specialist persona. `'implementation'`
+   * opens the agentic loop to real work: bash (build/lint/test/git), file
+   * edits/writes under the agent workspace and the assigned repo worktree, and
+   * external directory access to those roots. Used by provisioned coding agents
+   * that must build and test against an isolated checkout.
+   */
+  harness?: 'read-only' | 'implementation';
 }
 
 export interface QueryInput {

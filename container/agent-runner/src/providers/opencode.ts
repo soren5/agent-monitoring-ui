@@ -173,10 +173,15 @@ export class OpencodeProvider implements AgentProvider {
 
     // opencode config injected via OPENCODE_CONFIG_CONTENT:
     //  - the provider for this model's backend
-    //  - bounded permission policy aligned with the specialist persona:
-    //    read anywhere in the workspace; edit/write only under the agent
-    //    workspace and the assigned knowledge mount; bash restricted to
-    //    read-only inspection; no webfetch/websearch, no external dirs.
+    //  - a minimal permission policy. File and bash operations are left to the
+    //    container mounts: NanoClaw mounts only the agent workspace and any
+    //    assigned repo worktree read-write, everything else read-only, so the
+    //    harness can freely read/edit/run inside what is mounted and physically
+    //    cannot touch anything else. The only policy kept here is for actions
+    //    the mounts don't cover: no web fetch/search, no user questions, and a
+    //    doom-loop guard. The `harness` option distinguishes specialist
+    //    (read-only) from coding agents only at the instruction level; both rely
+    //    on mounts for the actual filesystem boundary.
     this.serverConfig = {
       provider: {
         [providerID]: {
@@ -188,35 +193,19 @@ export class OpencodeProvider implements AgentProvider {
         },
       },
       permission: {
+        // Mounts are the boundary: NanoClaw mounts only the agent workspace and
+        // any repo worktree read-write, and everything else read-only. Allow the
+        // harness full use of what is mounted; no path policy here.
         read: 'allow',
-        edit: {
-          '/workspace/agent/**': 'allow',
-          '/workspace/extra/knowledge/**': 'allow',
-          '*': 'deny',
-        },
-        bash: {
-          '*': 'deny',
-          'ls *': 'allow',
-          'cat *': 'allow',
-          'grep *': 'allow',
-          'rg *': 'allow',
-          'find *': 'allow',
-          'wc *': 'allow',
-          'head *': 'allow',
-          'tail *': 'allow',
-          'stat *': 'allow',
-          'pwd': 'allow',
-          'echo *': 'allow',
-        },
-        external_directory: {
-          '/workspace/extra/knowledge/**': 'allow',
-          '/workspace/agent/**': 'allow',
-          '*': 'deny',
-        },
+        edit: 'allow',
+        bash: 'allow',
         webfetch: 'deny',
         websearch: 'deny',
         question: 'deny',
         doom_loop: 'ask',
+        // external_directory is left at opencode's default ('ask'), so anything
+        // outside the harness working directory surfaces a request the provider
+        // auto-denies — belt-and-suspenders on top of the mount boundary.
       },
       mcp: {
         nanoclaw: {

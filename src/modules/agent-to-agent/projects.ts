@@ -22,7 +22,7 @@ import { wakeContainer } from '../../container-runner.js';
 import type { AgentGroup, MessagingGroup, Session } from '../../types.js';
 
 const DISCORD = /^discord:([1-9][0-9]{4,24}):([1-9][0-9]{4,24})$/;
-const ROLES = new Set(['junior', 'api', 'local-coding', 'test', 'reviewer']);
+const ROLES = new Set(['junior', 'codex', 'deepseek', 'local-coding', 'test', 'reviewer']);
 const MODELS = new Set(['google/gemma-4-12b-qat', 'qwen/qwen3.6-27b']);
 const CHILD_ACTIONS = new Set([
   'create-child',

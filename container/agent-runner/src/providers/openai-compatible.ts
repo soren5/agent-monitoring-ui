@@ -1,6 +1,7 @@
 import { archiveProviderExchange } from './exchange-archive.js';
 import { registerProvider } from './provider-registry.js';
 import { callRegisteredTool, registeredTools } from '../mcp-tools/server.js';
+import { touchHeartbeat } from '../db/connection.js';
 import '../mcp-tools/core.js';
 import '../mcp-tools/interactive.js';
 import '../mcp-tools/agents.js';
@@ -72,13 +73,27 @@ export class OpenAiCompatibleProvider implements AgentProvider {
           if (!prompt) continue;
           history.push({ role: 'user', content: prompt });
           controller = new AbortController();
+          // Local models are slow (~8-10 tok/s). Give a single generation a
+          // generous 10-minute budget so it isn't aborted by the runtime's
+          // default fetch timeout mid-reply; the host sweep still enforces the
+          // absolute stuck ceiling, so a truly hung request is still reaped.
+          const fetchTimeout = setTimeout(() => controller?.abort(), 10 * 60_000);
+          // Keep the container alive while the model is generating: the host
+          // sweep's claim-stuck rule treats silence past ~60s as dead, but a
+          // local-model call takes minutes. Touch the heartbeat every 20s so
+          // the sweep sees fresh liveness until the fetch resolves.
+          const heartbeatKeeper = setInterval(() => touchHeartbeat(), 20_000);
           try {
             yield { type: 'activity' };
             const tools = registeredTools().map((entry) => ({ type: 'function', function: { name: entry.tool.name, description: entry.tool.description, parameters: entry.tool.inputSchema } }));
+            // Bound the generation: local models (gemma-4-12b-qat) run at
+            // ~8-10 tok/s, so an unconstrained completion can run for many
+            // minutes and trip the runtime's fetch timeout. A generous cap
+            // keeps replies complete while preventing a runaway generation.
             const response = await fetch(`${BASE_URL}/chat/completions`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ model, messages: history, tools, tool_choice: 'auto', stream: false }),
+              body: JSON.stringify({ model, messages: history, tools, tool_choice: 'auto', stream: false, max_tokens: 2048 }),
               signal: controller.signal,
             });
             if (!response.ok) throw new Error(`Local model request failed: HTTP ${response.status} ${await response.text()}`);
@@ -105,6 +120,8 @@ export class OpenAiCompatibleProvider implements AgentProvider {
             if (aborted) return;
             yield { type: 'error', message: err instanceof Error ? err.message : String(err), retryable: true };
           } finally {
+            clearTimeout(fetchTimeout);
+            clearInterval(heartbeatKeeper);
             controller = null;
           }
         }
