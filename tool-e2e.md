@@ -1,0 +1,1 @@
+deterministic delegation tool loop verified
