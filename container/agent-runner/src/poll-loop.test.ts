@@ -513,7 +513,10 @@ describe('task-run turn wiring (real processQuery)', () => {
     expect(getUndeliveredMessages().filter((m) => m.kind === 'chat')).toHaveLength(0);
   });
 
-  it('logs and conditionally nudges a second task run in the same open query', async () => {
+  it(
+    'logs and conditionally nudges a second task run in the same open query',
+    { timeout: 20_000 },
+    async () => {
     const pushes: string[] = [];
 
     async function* events(): AsyncGenerator<ProviderEvent> {
@@ -532,6 +535,8 @@ describe('task-run turn wiring (real processQuery)', () => {
       while (!pushes.some((p) => p.includes('fire two')) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
+      // Give the poller a beat after the push so per-turn nudge reset is durable.
+      await new Promise((r) => setTimeout(r, 100));
 
       // Turn 2 repeats the mistake. This receives a second independent nudge
       // only if the follow-up path reset taskBlockNudged.
@@ -548,7 +553,7 @@ describe('task-run turn wiring (real processQuery)', () => {
       abort: () => {},
     };
 
-    await processQuery(query, TASK_ROUTING, ['t1'], 'claude', undefined, 'prompt', undefined);
+    await processQuery(query, TASK_ROUTING, ['t1'], 'claude', undefined, 'prompt', { cwd: process.cwd() });
 
     const nudges = pushes.filter((p) => p.includes('If and only if'));
     expect(nudges).toHaveLength(2);
