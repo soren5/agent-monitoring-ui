@@ -439,10 +439,21 @@ function positiveNumber(value: unknown, fallback: number): number {
 }
 
 function resolveCommandCwd(value: unknown): string {
-  if (typeof value !== 'string' || !value) return '/workspace/agent';
-  const resolved = path.resolve(value);
-  if (!resolved.startsWith('/workspace/')) throw new Error(`command hook cwd outside /workspace: ${value}`);
-  return resolved;
+  if (typeof value === 'string' && value) {
+    const resolved = path.resolve(value);
+    if (!resolved.startsWith('/workspace/')) throw new Error(`command hook cwd outside /workspace: ${value}`);
+    return resolved;
+  }
+  // Default to /workspace/agent (the container agent workspace). When that
+  // doesn't exist (e.g. running tests outside a container), fall back to the
+  // process cwd so command hooks don't fail with posix_spawn ENOENT.
+  const defaultCwd = '/workspace/agent';
+  try {
+    fs.accessSync(defaultCwd);
+    return defaultCwd;
+  } catch {
+    return process.cwd();
+  }
 }
 
 function validateHookResult(result: AgentHookResult): void {
@@ -712,7 +723,11 @@ function resolveAgentCallArchivePath(hook: AgentHookDefinition, input: AgentHook
   const rawPath =
     configuredPath ?? path.join(DEFAULT_AGENT_CALL_ARCHIVE_DIR, `${new Date().toISOString().slice(0, 10)}.jsonl`);
   const resolved = path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(cwd, rawPath);
-  if (!resolved.startsWith('/workspace/')) throw new Error(`agent_call_archive path outside /workspace: ${rawPath}`);
+  // Archives must stay inside /workspace (the container agent workspace) unless
+  // an operator opts out via NANOCLAW_AGENT_CALL_ARCHIVE_ROOT — also used to
+  // run the archive tests outside a container where /workspace may be absent.
+  const root = process.env.NANOCLAW_AGENT_CALL_ARCHIVE_ROOT || '/workspace/';
+  if (!resolved.startsWith(root)) throw new Error(`agent_call_archive path outside ${root}: ${rawPath}`);
   return resolved;
 }
 
