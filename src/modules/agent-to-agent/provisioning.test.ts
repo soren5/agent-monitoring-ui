@@ -539,4 +539,63 @@ describe('owner-approved autonomous provisioning', () => {
         .get(childId),
     ).toMatchObject({ n: 3 });
   });
+
+  it('delegates the exact requested branch prefix when the parent holds multiple grants for the same repository', async () => {
+    for (const [action, prefix] of [
+      ['read', ''],
+      ['branch-write', 'feature/m1-ui-scaffold'],
+      ['pr-create', 'feature/m1-ui-scaffold'],
+      ['branch-write', 'feature/m1-agent-monitor-events'],
+      ['pr-create', 'feature/m1-agent-monitor-events'],
+    ] as const) {
+      getDb()
+        .prepare(
+          `INSERT INTO capability_grants
+           (grant_id, subject_agent_group_id, resource_type, resource_id, actions_json, constraints_json, parent_grant_id, issued_by_principal_id, issued_by_owner_id, issued_at)
+           VALUES (?, ?, 'repository', 'soren5/agent-monitoring-ui', ?, ?, NULL, 'owner', 'owner', ?)`,
+        )
+        .run(
+          `cap-${crypto.randomUUID()}`,
+          ROOT,
+          JSON.stringify([action]),
+          action === 'read'
+            ? '{}'
+            : action === 'pr-create'
+              ? JSON.stringify({ head_prefix: prefix })
+              : JSON.stringify({ branch_prefix: prefix }),
+          new Date().toISOString(),
+        );
+    }
+    await requestAgentProvision(
+      {
+        template_id: 'local-coding',
+        display_name: 'M1 Engineer',
+        repository_id: 'soren5/agent-monitoring-ui',
+        repository_branch_prefix: 'feature/m1-agent-monitor-events',
+      },
+      session,
+    );
+    const request = getDb().prepare('SELECT * FROM agent_provision_requests').get() as Record<string, string>;
+    await approval()({
+      session,
+      payload: { request_id: request.request_id },
+      approval: { approval_id: 'owner-approval' },
+    });
+    const childId = (
+      getDb()
+        .prepare('SELECT provisioned_child_group_id FROM agent_provision_requests WHERE request_id=?')
+        .get(request.request_id) as Record<string, string>
+    ).provisioned_child_group_id;
+    const childGrants = getDb()
+      .prepare(
+        "SELECT actions_json, constraints_json FROM capability_grants WHERE subject_agent_group_id=? AND resource_type='repository' AND revoked_at IS NULL",
+      )
+      .all(childId) as Array<{ actions_json: string; constraints_json: string }>;
+    expect(childGrants).toHaveLength(3);
+    for (const grant of childGrants) {
+      const constraints = JSON.parse(grant.constraints_json) as Record<string, string>;
+      const prefix = constraints.branch_prefix ?? constraints.head_prefix;
+      expect(prefix).toBe('feature/m1-agent-monitor-events');
+    }
+  });
 });

@@ -46,6 +46,10 @@ function audit(subject: string, grantId: string | null, operation: string, outco
 export function constraintsCover(parent: Record<string, unknown>, requested: Record<string, unknown>): boolean {
   return Object.entries(requested).every(([key, value]) => {
     const allowed = parent[key];
+    // An unconstrained parent grant covers any narrower request along this
+    // dimension (e.g. a read grant with no branch scope authorizes a
+    // branch-scoped read).
+    if (allowed === undefined) return true;
     if ((key === 'branch_prefix' || key === 'head_prefix') && typeof allowed === 'string' && typeof value === 'string')
       return value.startsWith(allowed);
     if (Array.isArray(allowed)) return Array.isArray(value) && value.every((v) => allowed.includes(v));
