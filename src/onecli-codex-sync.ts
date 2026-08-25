@@ -21,8 +21,11 @@ import path from 'path';
 import { DATA_DIR, ONECLI_API_KEY, ONECLI_URL } from './config.js';
 import { log } from './log.js';
 
-/** Host-side codex auth file — the source of truth for refreshed tokens. */
-export const CODEX_AUTH_PATH = path.join(os.homedir(), '.codex', 'auth.json');
+/** Host-side codex auth file — the source of truth for refreshed tokens.
+ *  Overridable (e.g. for tests) via NANOCLAW_CODEX_AUTH_PATH. */
+export function codexAuthPath(): string {
+  return process.env.NANOCLAW_CODEX_AUTH_PATH || path.join(os.homedir(), '.codex', 'auth.json');
+}
 /** Where we persist the last `last_refresh` value we pushed, to detect changes. */
 const SYNC_STATE_PATH = path.join(DATA_DIR, 'onecli-codex-sync-state.json');
 /** Vault secret lookup — the gateway serves every secret from the web API. */
@@ -70,9 +73,10 @@ function isPlaceholderAuth(parsed: { tokens?: Record<string, unknown> }): boolea
  * throws — caller (watcher or poll) logs and continues.
  */
 export async function syncCodexAuthIfNewer(): Promise<boolean> {
+  const authPath = codexAuthPath();
   let raw: string;
   try {
-    raw = fs.readFileSync(CODEX_AUTH_PATH, 'utf8');
+    raw = fs.readFileSync(authPath, 'utf8');
   } catch {
     // No host codex login yet — nothing to sync.
     return false;
@@ -82,20 +86,20 @@ export async function syncCodexAuthIfNewer(): Promise<boolean> {
   try {
     parsed = JSON.parse(raw) as { last_refresh?: string; tokens?: Record<string, unknown> };
   } catch {
-    log.warn('Ignoring unparsable codex auth file', { path: CODEX_AUTH_PATH });
+    log.warn('Ignoring unparsable codex auth file', { path: authPath });
     return false;
   }
 
   if (isPlaceholderAuth(parsed)) {
     // A `codex login` that never completed leaves sentinel tokens. Never push
     // these over a valid vault credential — doing so 401s every container.
-    log.warn('Ignoring codex auth placeholder skeleton (login not completed)', { path: CODEX_AUTH_PATH });
+    log.warn('Ignoring codex auth placeholder skeleton (login not completed)', { path: authPath });
     return false;
   }
 
   const currentRefresh = parsed.last_refresh;
   if (!currentRefresh) {
-    log.warn('Ignoring codex auth file without last_refresh', { path: CODEX_AUTH_PATH });
+    log.warn('Ignoring codex auth file without last_refresh', { path: authPath });
     return false;
   }
 
@@ -162,7 +166,7 @@ export function startCodexAuthSync(): void {
   void syncCodexAuthIfNewer().catch((err) => log.warn('Codex auth sync (startup) failed', { err }));
 
   try {
-    watcher = fs.watch(CODEX_AUTH_PATH, () => {
+    watcher = fs.watch(codexAuthPath(), () => {
       void syncCodexAuthIfNewer().catch((err) => log.warn('Codex auth sync failed', { err }));
     });
   } catch {
