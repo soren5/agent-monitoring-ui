@@ -48,6 +48,23 @@ function writeState(state: SyncState): void {
 }
 
 /**
+ * The codex CLI writes these sentinel values into `~/.codex/auth.json` while a
+ * `codex login` flow is in flight — or after one was interrupted before the
+ * browser/device step completed. Pushing such a file into the vault would
+ * overwrite a valid token with placeholders and 401 every container, so the
+ * sync refuses them.
+ */
+const CODEX_PLACEHOLDER_TOKENS = new Set(['at', 'rt', 'it', 'acct']);
+
+function isPlaceholderAuth(parsed: { tokens?: Record<string, unknown> }): boolean {
+  const tokens = parsed.tokens;
+  if (!tokens || typeof tokens !== 'object') return true;
+  return ['access_token', 'id_token', 'refresh_token', 'account_id'].some(
+    (key) => typeof tokens[key] === 'string' && CODEX_PLACEHOLDER_TOKENS.has(tokens[key] as string),
+  );
+}
+
+/**
  * Push `~/.codex/auth.json` into the vault when its `last_refresh` is newer than
  * what we last pushed. Returns `true` when a push happened. Best-effort: never
  * throws — caller (watcher or poll) logs and continues.
@@ -61,11 +78,18 @@ export async function syncCodexAuthIfNewer(): Promise<boolean> {
     return false;
   }
 
-  let parsed: { last_refresh?: string };
+  let parsed: { last_refresh?: string; tokens?: Record<string, unknown> };
   try {
-    parsed = JSON.parse(raw) as { last_refresh?: string };
+    parsed = JSON.parse(raw) as { last_refresh?: string; tokens?: Record<string, unknown> };
   } catch {
     log.warn('Ignoring unparsable codex auth file', { path: CODEX_AUTH_PATH });
+    return false;
+  }
+
+  if (isPlaceholderAuth(parsed)) {
+    // A `codex login` that never completed leaves sentinel tokens. Never push
+    // these over a valid vault credential — doing so 401s every container.
+    log.warn('Ignoring codex auth placeholder skeleton (login not completed)', { path: CODEX_AUTH_PATH });
     return false;
   }
 
