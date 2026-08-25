@@ -256,8 +256,7 @@ export class OpencodeProvider implements AgentProvider {
       // traffic to the harness server — wrap fetch so the request bypasses it.
       const client = createOpencodeClient({
         baseUrl: handle.url,
-        fetch: (input: RequestInfo | URL, init?: RequestInit) =>
-          withProxyBypass(() => fetch(input, init)),
+        fetch: (input: RequestInfo | URL, init?: RequestInit) => withProxyBypass(() => fetch(input, init)),
       });
 
       // Resolve session: reuse the continuation (resume) or create fresh.
@@ -350,6 +349,227 @@ export class OpencodeProvider implements AgentProvider {
   }
 }
 
+export interface OpencodeEventFixture {
+  type: string;
+  properties?: Record<string, unknown>;
+}
+
+export interface OpencodeTelemetryState {
+  providerID: string;
+  modelID: string;
+  sessionID: string;
+  reasoning: 'full' | 'activity_only' | 'unknown';
+  textByPart: Map<string, string>;
+  reasoningByPart: Map<string, string>;
+  startedTools: Set<string>;
+}
+
+export function createOpencodeTelemetryState(
+  providerID: string,
+  modelID: string,
+  sessionID: string,
+): OpencodeTelemetryState {
+  return {
+    providerID,
+    modelID,
+    sessionID,
+    reasoning: 'unknown',
+    textByPart: new Map(),
+    reasoningByPart: new Map(),
+    startedTools: new Set(),
+  };
+}
+
+export function translateOpencodeEvent(event: OpencodeEventFixture, state: OpencodeTelemetryState): ProviderEvent[] {
+  const events: ProviderEvent[] = [];
+  const properties = event.properties ?? {};
+  if (typeof properties.sessionID === 'string') state.sessionID = properties.sessionID;
+  const provenance = opencodeProvenance(state);
+  events.push({ type: 'activity', label: opencodeActivityLabel(event.type), status: 'in_progress', provenance });
+
+  if (event.type === 'message.part.updated') {
+    const part = asOpencodeRecord(properties.part);
+    if (!part) return events;
+    const partID = typeof part.id === 'string' ? part.id : undefined;
+    const partProvenance = opencodeProvenance(
+      state,
+      typeof part.messageID === 'string' ? part.messageID : undefined,
+      partID,
+    );
+    if (part.type === 'text' && typeof part.text === 'string') {
+      const delta = opencodePartDelta(properties.delta, part.text, partID, state.textByPart);
+      if (delta)
+        events.push({
+          type: 'output',
+          text: redactOpencodeTelemetry(delta),
+          format: 'markdown',
+          partial: true,
+          provenance: partProvenance,
+        });
+    } else if (part.type === 'reasoning' && typeof part.text === 'string') {
+      const delta = opencodePartDelta(properties.delta, part.text, partID, state.reasoningByPart);
+      if (state.reasoning !== 'full') {
+        state.reasoning = 'full';
+        events.push({ type: 'capability', reasoning: 'full', toolProgress: true, provenance: partProvenance });
+      }
+      if (delta)
+        events.push({
+          type: 'reasoning',
+          availability: 'full',
+          content: redactOpencodeTelemetry(delta),
+          provenance: partProvenance,
+        });
+    } else if (part.type === 'tool') {
+      translateOpencodeToolPart(part, state, events, partProvenance);
+    } else if (part.type === 'step-finish') {
+      const tokens = asOpencodeRecord(part.tokens);
+      const reasoningTokens = numericOpencodeToken(tokens?.reasoning);
+      if (reasoningTokens > 0 && state.reasoning === 'unknown') {
+        state.reasoning = 'activity_only';
+        events.push({ type: 'capability', reasoning: 'activity_only', toolProgress: true, provenance: partProvenance });
+        events.push({ type: 'reasoning', availability: 'activity_only', provenance: partProvenance });
+      }
+      if (tokens) {
+        const promptTokens = numericOpencodeToken(tokens.input);
+        const completionTokens = numericOpencodeToken(tokens.output);
+        events.push({
+          type: 'usage',
+          usage: {
+            promptTokens,
+            completionTokens,
+            reasoningTokens: reasoningTokens || undefined,
+            totalTokens: promptTokens + completionTokens,
+          },
+        });
+      }
+    }
+  } else if (event.type === 'message.updated') {
+    const message = asOpencodeRecord(properties.message ?? properties.info);
+    const parts = Array.isArray(message?.parts) ? message.parts : [];
+    for (const raw of parts) {
+      const part = asOpencodeRecord(raw);
+      if (part?.type === 'text' && typeof part.text === 'string') {
+        events.push({
+          type: 'output',
+          text: redactOpencodeTelemetry(part.text),
+          format: 'markdown',
+          partial: false,
+          provenance,
+        });
+      }
+    }
+  } else if (event.type === 'session.status') {
+    const status = asOpencodeRecord(properties.status);
+    const type = typeof status?.type === 'string' ? status.type : 'unknown';
+    events.push({
+      type: 'status',
+      status: type === 'busy' ? 'in_progress' : type === 'idle' ? 'idle' : type === 'retry' ? 'waiting' : 'unknown',
+      activity: `OpenCode status: ${type}`,
+      provenance,
+    });
+  } else if (event.type === 'session.idle') {
+    events.push({ type: 'status', status: 'idle', activity: 'OpenCode turn completed', provenance });
+  } else if (event.type === 'session.error') {
+    const error = asOpencodeRecord(properties.error);
+    const message = typeof error?.message === 'string' ? error.message : 'OpenCode turn failed';
+    events.push({
+      type: 'error',
+      message: redactOpencodeTelemetry(message),
+      retryable: false,
+      classification: classifyError(message),
+      code: typeof error?.name === 'string' ? error.name : undefined,
+      provenance,
+    });
+    events.push({ type: 'status', status: 'failed', activity: 'OpenCode turn failed', provenance });
+  }
+  return events;
+}
+
+function translateOpencodeToolPart(
+  part: Record<string, unknown>,
+  state: OpencodeTelemetryState,
+  events: ProviderEvent[],
+  provenance: NonNullable<Extract<ProviderEvent, { type: 'activity' }>['provenance']>,
+): void {
+  const id = typeof part.callID === 'string' ? part.callID : typeof part.id === 'string' ? part.id : undefined;
+  if (!id) return;
+  const name = typeof part.tool === 'string' ? redactOpencodeTelemetry(part.tool).slice(0, 120) : 'tool';
+  const toolState = asOpencodeRecord(part.state);
+  const status = typeof toolState?.status === 'string' ? toolState.status : 'unknown';
+  if ((status === 'pending' || status === 'running') && !state.startedTools.has(id)) {
+    state.startedTools.add(id);
+    events.push({ type: 'tool', phase: 'start', name, toolCallId: id, provenance });
+  }
+  if (status === 'running') {
+    const time = asOpencodeRecord(toolState?.time);
+    events.push({
+      type: 'tool',
+      phase: 'progress',
+      name,
+      toolCallId: id,
+      detail: typeof time?.start === 'number' ? { startedAt: time.start } : undefined,
+      provenance,
+    });
+  } else if (status === 'completed' || status === 'error') {
+    events.push({
+      type: 'tool',
+      phase: 'complete',
+      name,
+      toolCallId: id,
+      detail: {
+        status: status === 'error' ? 'failed' : 'completed',
+        ...(typeof toolState?.error === 'string' ? { error: redactOpencodeTelemetry(toolState.error) } : {}),
+      },
+      provenance,
+    });
+  }
+}
+
+function opencodePartDelta(
+  explicit: unknown,
+  assembled: string,
+  id: string | undefined,
+  cache: Map<string, string>,
+): string {
+  if (!id) return typeof explicit === 'string' ? explicit : assembled;
+  const previous = cache.get(id) ?? '';
+  cache.set(id, assembled);
+  if (typeof explicit === 'string') return explicit;
+  return assembled.startsWith(previous) ? assembled.slice(previous.length) : assembled;
+}
+
+function opencodeProvenance(state: OpencodeTelemetryState, turnId?: string, itemId?: string) {
+  return {
+    provider: 'opencode',
+    model: state.modelID,
+    sessionId: state.sessionID,
+    ...(turnId ? { turnId } : {}),
+    ...(itemId ? { itemId } : {}),
+    providerID: state.providerID,
+  } as const;
+}
+
+function opencodeActivityLabel(type: string): string {
+  if (type === 'message.part.updated') return 'OpenCode streaming';
+  if (type.startsWith('session.')) return 'OpenCode session activity';
+  return 'OpenCode provider activity';
+}
+
+function asOpencodeRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
+}
+
+function numericOpencodeToken(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+export function redactOpencodeTelemetry(text: string): string {
+  return text
+    .replace(/(api[_-]?key|token|secret|password)(\s*[:=]\s*)[^\s,;]+/gi, '$1$2[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
+    .slice(0, 2_000);
+}
+
 async function* runOneTurn(
   client: ReturnType<typeof createOpencodeClient>,
   sessionId: string,
@@ -362,7 +582,8 @@ async function* runOneTurn(
   setAbortWaker: (waker: (() => void) | null) => void,
   setReasoning: (reasoning: string) => void,
 ): AsyncGenerator<ProviderEvent> {
-  const state: { error: Error | null } = { error: null };
+  const state: { error: Error | null; errorEmitted: boolean } = { error: null, errorEmitted: false };
+  const telemetryState = createOpencodeTelemetryState(model.providerID, model.modelID, sessionId);
   let resultText = '';
   let reasoningText = '';
   let turnDone = false;
@@ -394,7 +615,9 @@ async function* runOneTurn(
   }
 
   const handleEvent = (e: Event): void => {
-    buffer.push({ type: 'activity' });
+    const telemetry = translateOpencodeEvent(e as unknown as OpencodeEventFixture, telemetryState);
+    buffer.push(...telemetry);
+    if (telemetry.some((event) => event.type === 'error')) state.errorEmitted = true;
     switch (e.type) {
       case 'message.part.updated': {
         const part = e.properties?.part;
@@ -407,10 +630,14 @@ async function* runOneTurn(
       }
       case 'message.updated': {
         // Fallback: some harness versions emit the assembled message here.
-        const content = (e as unknown as { properties?: { message?: { parts?: Array<{ type?: string; text?: string }> } } })
-          .properties?.message?.parts;
+        const content = (
+          e as unknown as { properties?: { message?: { parts?: Array<{ type?: string; text?: string }> } } }
+        ).properties?.message?.parts;
         if (Array.isArray(content)) {
-          const text = content.filter((p) => p.type === 'text' && typeof p.text === 'string').map((p) => p.text).join('');
+          const text = content
+            .filter((p) => p.type === 'text' && typeof p.text === 'string')
+            .map((p) => p.text)
+            .join('');
           if (text) resultText = text;
         }
         break;
@@ -443,10 +670,12 @@ async function* runOneTurn(
         // Auto-deny permission requests — never let a local agent escalate.
         const p = e.properties as Permission;
         log(`permission request denied: ${p.title}`);
-        void client.postSessionIdPermissionsPermissionId({
-          path: { id: sessionId, permissionID: p.id },
-          body: { response: 'reject' },
-        }).catch(() => {});
+        void client
+          .postSessionIdPermissionsPermissionId({
+            path: { id: sessionId, permissionID: p.id },
+            body: { response: 'reject' },
+          })
+          .catch(() => {});
         break;
       }
       default:
@@ -502,12 +731,16 @@ async function* runOneTurn(
     if (isAborted()) return;
 
     if (state.error) {
-      yield {
-        type: 'error',
-        message: state.error.message,
-        retryable: false,
-        classification: classifyError(state.error.message),
-      };
+      if (!state.errorEmitted) {
+        state.errorEmitted = true;
+        yield {
+          type: 'error',
+          message: redactOpencodeTelemetry(state.error.message),
+          retryable: false,
+          classification: classifyError(state.error.message),
+          provenance: opencodeProvenance(telemetryState),
+        };
+      }
       throw state.error;
     }
 
@@ -516,12 +749,16 @@ async function* runOneTurn(
   } catch (err) {
     if (isAborted()) return;
     if (state.error) {
-      yield {
-        type: 'error',
-        message: state.error.message,
-        retryable: false,
-        classification: classifyError(state.error.message),
-      };
+      if (!state.errorEmitted) {
+        state.errorEmitted = true;
+        yield {
+          type: 'error',
+          message: redactOpencodeTelemetry(state.error.message),
+          retryable: false,
+          classification: classifyError(state.error.message),
+          provenance: opencodeProvenance(telemetryState),
+        };
+      }
       throw state.error;
     }
     throw err;

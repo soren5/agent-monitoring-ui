@@ -93,7 +93,7 @@ export async function createFeatureBranch(
   subjectAgentGroupId: string,
   repository: string,
   branch: string,
-  base = 'main',
+  base = 'agent',
 ): Promise<{ branch: string; sha: string }> {
   const grant = findEffectiveGrant(subjectAgentGroupId, {
     resourceType: 'repository',
@@ -126,7 +126,7 @@ export async function createPullRequest(
   head: string,
   title: string,
   body: string,
-  base = 'main',
+  base = 'agent',
 ): Promise<{ number: number; url: string }> {
   const grant = findEffectiveGrant(subjectAgentGroupId, {
     resourceType: 'repository',

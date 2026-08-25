@@ -4,3 +4,4 @@ export * from './telemetry.js';
 export * from './commands.js';
 export * from './transport.js';
 export * from './host-delivery.js';
+export * from './runner-telemetry-drainer.js';

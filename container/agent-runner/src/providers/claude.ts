@@ -559,15 +559,21 @@ export class ClaudeProvider implements AgentProvider {
     });
 
     let aborted = false;
+    const providerModel = this.model;
+    const providerEffort = this.effort;
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
+      const telemetryState = createClaudeTelemetryState(providerModel, providerEffort);
       for await (const message of sdkResult) {
         if (aborted) return;
         messageCount++;
 
-        // Yield activity for every SDK event so the poll loop knows the agent is working
-        yield { type: 'activity' };
+        // Yield normalized telemetry for every SDK event while preserving the
+        // legacy result/progress path below byte-for-byte.
+        for (const event of translateClaudeTelemetryMessage(message as unknown as ClaudeSdkFixture, telemetryState)) {
+          yield event;
+        }
 
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
@@ -636,6 +642,335 @@ export class ClaudeProvider implements AgentProvider {
       },
     };
   }
+}
+
+export interface ClaudeSdkFixture {
+  type: string;
+  subtype?: string;
+  session_id?: string;
+  uuid?: string;
+  parent_tool_use_id?: string | null;
+  message?: { id?: string; model?: string; content?: unknown[]; usage?: Record<string, number> };
+  event?: { type?: string; index?: number; content_block?: Record<string, unknown>; delta?: Record<string, unknown> };
+  tool_use_id?: string;
+  tool_name?: string;
+  elapsed_time_seconds?: number;
+  summary?: string;
+  preceding_tool_use_ids?: string[];
+  estimated_tokens?: number;
+  estimated_tokens_delta?: number;
+  usage?: Record<string, number>;
+  errors?: string[];
+  result?: string;
+  is_error?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ClaudeTelemetryState {
+  model?: string;
+  effort?: string;
+  sessionId?: string;
+  reasoning: 'full' | 'activity_only' | 'none' | 'unknown';
+  blocks: Map<number, { id?: string; name?: string; kind: 'tool' | 'reasoning' | 'text' | 'other' }>;
+  startedTools: Set<string>;
+}
+
+export function createClaudeTelemetryState(model?: string, effort?: string): ClaudeTelemetryState {
+  return {
+    model,
+    effort,
+    reasoning: effort === 'none' ? 'none' : 'unknown',
+    blocks: new Map(),
+    startedTools: new Set(),
+  };
+}
+
+export function translateClaudeTelemetryMessage(
+  message: ClaudeSdkFixture,
+  state: ClaudeTelemetryState,
+): ProviderEvent[] {
+  const events: ProviderEvent[] = [];
+  if (message.session_id) state.sessionId = message.session_id;
+  const model = message.message?.model || state.model;
+  if (model) state.model = model;
+  const provenance = claudeProvenance(state, message.uuid);
+  events.push({ type: 'activity', label: claudeActivityLabel(message), status: 'in_progress', provenance });
+
+  if (message.type === 'system' && message.subtype === 'init') {
+    events.push({ type: 'capability', reasoning: state.reasoning, toolProgress: true, provenance });
+    events.push({ type: 'status', status: 'starting', activity: 'Claude session initialized', provenance });
+  } else if (message.type === 'system' && message.subtype === 'status') {
+    const status = message.status;
+    events.push({
+      type: 'status',
+      status: status === null ? 'in_progress' : status === 'compacting' ? 'in_progress' : 'waiting',
+      activity: typeof status === 'string' ? `Claude ${status}` : 'Claude working',
+      provenance,
+    });
+  } else if (message.type === 'stream_event') {
+    translateClaudeStreamEvent(message, state, events);
+  } else if (message.type === 'assistant') {
+    translateClaudeAssistantMessage(message, state, events);
+    if (typeof message.error === 'string') {
+      events.push({
+        type: 'error',
+        message: redactClaudeTelemetry(message.error),
+        retryable: message.error === 'rate_limit' || message.error === 'overloaded' || message.error === 'server_error',
+        classification: classifyClaudeTelemetryError(message.error),
+        code: message.error,
+        provenance,
+      });
+    }
+  } else if (message.type === 'user') {
+    translateClaudeToolResults(message, state, events);
+  } else if (message.type === 'tool_progress' && message.tool_use_id) {
+    events.push({
+      type: 'tool',
+      phase: 'progress',
+      name: safeClaudeLabel(message.tool_name, 'tool'),
+      toolCallId: message.tool_use_id,
+      detail: { elapsedSeconds: message.elapsed_time_seconds },
+      provenance: claudeProvenance(state, message.tool_use_id),
+    });
+  } else if (message.type === 'tool_use_summary') {
+    for (const id of message.preceding_tool_use_ids ?? []) {
+      events.push({
+        type: 'tool',
+        phase: 'progress',
+        name: 'tool',
+        toolCallId: id,
+        detail: { summary: redactClaudeTelemetry(message.summary ?? '') },
+        provenance: claudeProvenance(state, id),
+      });
+    }
+  } else if (message.type === 'system' && message.subtype === 'thinking_tokens') {
+    if (state.reasoning === 'unknown') {
+      state.reasoning = 'activity_only';
+      events.push({ type: 'capability', reasoning: 'activity_only', toolProgress: true, provenance });
+    }
+    events.push({
+      type: 'reasoning',
+      availability: 'activity_only',
+      provenance,
+    });
+  } else if (message.type === 'result') {
+    if (message.is_error) {
+      const rawError = message.errors?.join('\n') || 'Claude turn failed';
+      events.push({
+        type: 'error',
+        message: redactClaudeTelemetry(rawError),
+        retryable: false,
+        classification: classifyClaudeTelemetryError(rawError),
+        provenance,
+      });
+    }
+    const usage = message.usage;
+    if (usage) {
+      const promptTokens = numericToken(usage.input_tokens);
+      const completionTokens = numericToken(usage.output_tokens);
+      events.push({
+        type: 'usage',
+        usage: { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens },
+      });
+    }
+    events.push({
+      type: 'status',
+      status: message.is_error ? 'failed' : 'idle',
+      activity: message.is_error ? 'Claude turn failed' : 'Claude turn completed',
+      provenance,
+    });
+  }
+  return events;
+}
+
+function translateClaudeStreamEvent(
+  message: ClaudeSdkFixture,
+  state: ClaudeTelemetryState,
+  events: ProviderEvent[],
+): void {
+  const event = message.event ?? {};
+  const index = typeof event.index === 'number' ? event.index : -1;
+  const provenance = claudeProvenance(state, message.uuid);
+  if (event.type === 'content_block_start') {
+    const block = event.content_block ?? {};
+    const blockType = typeof block.type === 'string' ? block.type : 'other';
+    if (blockType === 'tool_use') {
+      const id = typeof block.id === 'string' ? block.id : undefined;
+      const name = safeClaudeLabel(block.name, 'tool');
+      state.blocks.set(index, { id, name, kind: 'tool' });
+      if (id && !state.startedTools.has(id)) {
+        state.startedTools.add(id);
+        events.push({
+          type: 'tool',
+          phase: 'start',
+          name,
+          toolCallId: id,
+          detail: message.parent_tool_use_id ? { parentToolCallId: message.parent_tool_use_id } : undefined,
+          provenance: claudeProvenance(state, id),
+        });
+      }
+    } else if (blockType === 'thinking') {
+      state.blocks.set(index, { kind: 'reasoning' });
+      upgradeClaudeReasoning(state, events, 'full', provenance);
+      const thinking = typeof block.thinking === 'string' ? block.thinking : '';
+      if (thinking)
+        events.push({ type: 'reasoning', availability: 'full', content: redactClaudeTelemetry(thinking), provenance });
+    } else if (blockType === 'redacted_thinking') {
+      state.blocks.set(index, { kind: 'reasoning' });
+      upgradeClaudeReasoning(state, events, 'activity_only', provenance);
+      events.push({ type: 'reasoning', availability: 'activity_only', provenance });
+    } else {
+      state.blocks.set(index, { kind: blockType === 'text' ? 'text' : 'other' });
+    }
+  } else if (event.type === 'content_block_delta') {
+    const delta = event.delta ?? {};
+    if (delta.type === 'text_delta' && typeof delta.text === 'string') {
+      events.push({
+        type: 'output',
+        text: redactClaudeTelemetry(delta.text),
+        format: 'markdown',
+        partial: true,
+        provenance,
+      });
+    } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+      upgradeClaudeReasoning(state, events, 'full', provenance);
+      events.push({
+        type: 'reasoning',
+        availability: 'full',
+        content: redactClaudeTelemetry(delta.thinking),
+        provenance,
+      });
+    }
+  } else if (event.type === 'content_block_stop') {
+    const block = state.blocks.get(index);
+    if (block?.kind === 'tool' && block.id) {
+      events.push({
+        type: 'tool',
+        phase: 'progress',
+        name: block.name ?? 'tool',
+        toolCallId: block.id,
+        detail: { summary: 'input accepted' },
+        provenance: claudeProvenance(state, block.id),
+      });
+    }
+    state.blocks.delete(index);
+  }
+}
+
+function translateClaudeAssistantMessage(
+  message: ClaudeSdkFixture,
+  state: ClaudeTelemetryState,
+  events: ProviderEvent[],
+): void {
+  const content = message.message?.content ?? [];
+  for (const raw of content) {
+    if (!raw || typeof raw !== 'object') continue;
+    const block = raw as Record<string, unknown>;
+    if (block.type === 'text' && typeof block.text === 'string') {
+      events.push({
+        type: 'output',
+        text: redactClaudeTelemetry(block.text),
+        format: 'markdown',
+        partial: false,
+        provenance: claudeProvenance(state, message.uuid),
+      });
+    } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+      const provenance = claudeProvenance(state, message.uuid);
+      upgradeClaudeReasoning(state, events, 'full', provenance);
+      events.push({
+        type: 'reasoning',
+        availability: 'full',
+        content: redactClaudeTelemetry(block.thinking),
+        provenance,
+      });
+    } else if (block.type === 'redacted_thinking') {
+      const provenance = claudeProvenance(state, message.uuid);
+      upgradeClaudeReasoning(state, events, 'activity_only', provenance);
+      events.push({ type: 'reasoning', availability: 'activity_only', provenance });
+    } else if (block.type === 'tool_use' && typeof block.id === 'string' && !state.startedTools.has(block.id)) {
+      state.startedTools.add(block.id);
+      events.push({
+        type: 'tool',
+        phase: 'start',
+        name: safeClaudeLabel(block.name, 'tool'),
+        toolCallId: block.id,
+        detail: message.parent_tool_use_id ? { parentToolCallId: message.parent_tool_use_id } : undefined,
+        provenance: claudeProvenance(state, block.id),
+      });
+    }
+  }
+}
+
+function translateClaudeToolResults(
+  message: ClaudeSdkFixture,
+  state: ClaudeTelemetryState,
+  events: ProviderEvent[],
+): void {
+  const content = message.message?.content ?? [];
+  for (const raw of content) {
+    if (!raw || typeof raw !== 'object') continue;
+    const block = raw as Record<string, unknown>;
+    if (block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    events.push({
+      type: 'tool',
+      phase: 'complete',
+      name: 'tool',
+      toolCallId: block.tool_use_id,
+      detail: { status: block.is_error === true ? 'failed' : 'completed' },
+      provenance: claudeProvenance(state, block.tool_use_id),
+    });
+  }
+}
+
+function upgradeClaudeReasoning(
+  state: ClaudeTelemetryState,
+  events: ProviderEvent[],
+  availability: 'full' | 'activity_only',
+  provenance: NonNullable<Extract<ProviderEvent, { type: 'activity' }>['provenance']>,
+): void {
+  if (state.reasoning === 'full' || state.reasoning === availability) return;
+  state.reasoning = availability;
+  events.push({ type: 'capability', reasoning: availability, toolProgress: true, provenance });
+}
+
+function claudeProvenance(state: ClaudeTelemetryState, itemId?: string) {
+  return {
+    provider: 'claude',
+    ...(state.model ? { model: state.model } : {}),
+    ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+    ...(itemId ? { itemId } : {}),
+  };
+}
+
+function classifyClaudeTelemetryError(value: string): string | undefined {
+  if (/billing|credit|quota|budget/i.test(value)) return 'quota';
+  if (/auth|oauth|credential|api.?key/i.test(value)) return 'auth';
+  if (/rate.?limit|overloaded|server.?error/i.test(value)) return 'rate_limit';
+  if (/permission|denied/i.test(value)) return 'permission';
+  return undefined;
+}
+
+function claudeActivityLabel(message: ClaudeSdkFixture): string {
+  if (message.type === 'stream_event') return 'Claude streaming';
+  if (message.type === 'tool_progress' || message.type === 'tool_use_summary') return 'Claude tool activity';
+  if (message.subtype === 'thinking_tokens') return 'Claude reasoning';
+  return 'Claude provider activity';
+}
+
+function safeClaudeLabel(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? redactClaudeTelemetry(value).slice(0, 120) : fallback;
+}
+
+function numericToken(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+/** Telemetry-only redaction. Never mutates the SDK result delivered to users. */
+export function redactClaudeTelemetry(text: string): string {
+  return text
+    .replace(/(api[_-]?key|token|secret|password)(\s*[:=]\s*)[^\s,;]+/gi, '$1$2[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
+    .slice(0, 2_000);
 }
 
 registerProvider('claude', (opts) => new ClaudeProvider(opts));

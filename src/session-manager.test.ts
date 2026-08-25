@@ -21,12 +21,14 @@ import {
   inboundDbPath,
   outboundDbPath,
   sessionDir,
+  markContainerIdle,
   writeOutboundDirect,
   writeSessionMessage,
 } from './session-manager.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import type { Session } from './types.js';
+import { setRuntimeTelemetrySink } from './monitor/telemetry.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-write-outbound';
 const AG = 'ag-test';
@@ -142,7 +144,15 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
   });
 
   afterEach(() => {
+    setRuntimeTelemetrySink(undefined);
     closeDb();
+  });
+
+  it('emits the authoritative idle transition when the persisted idle seam runs', () => {
+    const events: unknown[] = [];
+    setRuntimeTelemetrySink((type, agentGroupId, payload) => events.push({ type, agentGroupId, payload }));
+    markContainerIdle(SESS);
+    expect(events).toEqual([{ type: 'agent.status', agentGroupId: AG, payload: { status: 'idle' } }]);
   });
 
   it('re-creates the folder + inbound.db and does not throw when the row still exists', () => {

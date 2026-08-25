@@ -173,6 +173,148 @@ describe('CodexProvider active turns', () => {
     }
   });
 
+  it('translates representative notification fixtures in order without changing final output', async () => {
+    const fake = createFakeCodexRuntime();
+    const provider = createCodexProvider({ model: 'gpt-5.5', effort: 'high' }, fake.runtime);
+    const query = provider.query({ prompt: 'prompt', cwd: '/workspace/agent' });
+    const events: ProviderEvent[] = [];
+    const collect = collectEvents(query.events, events);
+    await waitFor(() => fake.startCalls.length === 1);
+
+    const fixtures: JsonRpcNotification[] = [
+      {
+        method: 'item/reasoning/summaryTextDelta',
+        params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'reason-1', delta: 'safe summary' },
+      },
+      {
+        method: 'item/started',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'mcpToolCall',
+            id: 'tool-1',
+            server: 'files',
+            tool: 'read',
+            arguments: { password: 'must-not-leak' },
+            status: 'inProgress',
+          },
+        },
+      },
+      {
+        method: 'item/mcpToolCall/progress',
+        params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'tool-1', message: 'token=abc progress' },
+      },
+      {
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'mcpToolCall',
+            id: 'tool-1',
+            server: 'files',
+            tool: 'read',
+            status: 'completed',
+            durationMs: 12,
+            result: { secret: 'must-not-leak' },
+          },
+        },
+      },
+      {
+        method: 'item/agentMessage/delta',
+        params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-1', delta: 'api_key=abc partial ' },
+      },
+      { method: 'future/newNotification', params: { arbitrary: true } },
+    ];
+    for (const fixture of fixtures) fake.notifyFixture(fixture);
+    query.end();
+    fake.completeTurn('api_key=abc final user output');
+    await collect;
+
+    const normalized = events.filter((event) => ['reasoning', 'tool', 'output'].includes(event.type));
+    expect(normalized.map((event) => (event.type === 'tool' ? `tool.${event.phase}` : event.type))).toEqual([
+      'reasoning',
+      'tool.start',
+      'tool.progress',
+      'tool.complete',
+      'output',
+    ]);
+    const tools = events.filter((event) => event.type === 'tool');
+    expect(tools.map((event) => (event.type === 'tool' ? event.toolCallId : undefined))).toEqual([
+      'tool-1',
+      'tool-1',
+      'tool-1',
+    ]);
+    expect(JSON.stringify(tools)).not.toContain('must-not-leak');
+    expect(JSON.stringify(events.filter((event) => event.type === 'output'))).toContain('[REDACTED]');
+    expect(events.filter((event) => event.type === 'result')).toEqual([
+      { type: 'result', text: 'api_key=abc final user output' },
+    ]);
+    expect(events.some((event) => event.type === 'activity' && event.label === 'Codex provider activity')).toBe(true);
+    expect(events.some((event) => event.type === 'reasoning' && event.availability === 'summary')).toBe(true);
+    expect(
+      events.some(
+        (event) =>
+          'provenance' in event && event.provenance?.model === 'gpt-5.5' && event.provenance.sessionId === 'thread-1',
+      ),
+    ).toBe(true);
+  });
+
+  it('emits none when reasoning is configured unavailable', async () => {
+    const fake = createFakeCodexRuntime();
+    const provider = createCodexProvider({ effort: 'none' }, fake.runtime);
+    const query = provider.query({ prompt: 'prompt', cwd: '/workspace/agent' });
+    const events: ProviderEvent[] = [];
+    const collect = collectEvents(query.events, events);
+    await waitFor(() => fake.startCalls.length === 1);
+    query.end();
+    fake.completeTurn('answer');
+    await collect;
+    expect(events.some((event) => event.type === 'capability' && event.reasoning === 'none')).toBe(true);
+    expect(events.some((event) => event.type === 'reasoning')).toBe(false);
+  });
+
+  it('translates tool failure and structured retryable errors safely', async () => {
+    const fake = createFakeCodexRuntime();
+    const provider = createCodexProvider({}, fake.runtime);
+    const query = provider.query({ prompt: 'prompt', cwd: '/workspace/agent' });
+    const events: ProviderEvent[] = [];
+    const collect = collectEvents(query.events, events).catch(() => {});
+    await waitFor(() => fake.startCalls.length === 1);
+    fake.notifyFixture({
+      method: 'item/started',
+      params: {
+        item: { type: 'commandExecution', id: 'cmd-1', command: 'echo secret', status: 'inProgress' },
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+      },
+    });
+    fake.notifyFixture({
+      method: 'item/completed',
+      params: {
+        item: { type: 'commandExecution', id: 'cmd-1', command: 'echo secret', status: 'failed', exitCode: 7 },
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+      },
+    });
+    fake.notifyFixture({
+      method: 'error',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        willRetry: true,
+        error: { message: 'token=abc rate limit', code: 'rate_limited' },
+      },
+    });
+    await collect;
+    const complete = events.find((event) => event.type === 'tool' && event.phase === 'complete');
+    expect(complete).toMatchObject({ type: 'tool', toolCallId: 'cmd-1', detail: { status: 'failed', exitCode: 7 } });
+    const error = events.find((event) => event.type === 'error');
+    expect(error).toMatchObject({ type: 'error', retryable: true, classification: 'quota', code: 'rate_limited' });
+    expect(error && error.type === 'error' ? error.message : '').toContain('[REDACTED]');
+  });
+
   it('ends the turn immediately with the real cause when the app-server dies mid-turn', async () => {
     const fake = createFakeCodexRuntime();
     const provider = createCodexProvider({}, fake.runtime);
@@ -242,6 +384,9 @@ function createFakeCodexRuntime(opts: { rejectSteer?: boolean } = {}) {
     },
     completeTurn(text: string) {
       notify('turn/completed', { turn: { items: [{ type: 'agentMessage', text }] } });
+    },
+    notifyFixture(notification: JsonRpcNotification) {
+      notify(notification.method, notification.params);
     },
     crashServer(err: Error) {
       for (const h of [...server.exitHandlers]) h(err);

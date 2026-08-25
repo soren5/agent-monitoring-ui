@@ -7,6 +7,7 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
+import { appendRunnerTelemetry } from './db/telemetry.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
   clearContinuation,
@@ -617,6 +618,7 @@ export async function processQuery(
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
+      appendProviderTelemetry(event, providerName, hookOptions?.agentGroupId);
       touchHeartbeat();
 
       if (event.type === 'init') {
@@ -817,6 +819,73 @@ function notifyExchangeComplete(
   }
 }
 
+export function appendProviderTelemetry(event: ProviderEvent, provider: string, agentGroupId?: string): void {
+  const eventProvenance = 'provenance' in event ? event.provenance : undefined;
+  const provenance: Record<string, unknown> = { provider, source: 'provider-event', ...eventProvenance };
+  if (agentGroupId) provenance.agentGroupId = agentGroupId;
+  switch (event.type) {
+    case 'reasoning':
+      appendRunnerTelemetry(
+        'reasoning.progress',
+        { availability: event.availability ?? 'unknown', ...(event.content ? { content: event.content } : {}) },
+        provenance,
+      );
+      break;
+    case 'capability':
+      appendRunnerTelemetry(
+        'agent.activity',
+        { label: 'capabilities', reasoning: event.reasoning, toolProgress: event.toolProgress },
+        provenance,
+      );
+      break;
+    case 'tool':
+      appendRunnerTelemetry(
+        `tool.${event.phase}`,
+        { name: event.name, ...(event.toolCallId ? { toolCallId: event.toolCallId } : {}), ...event.detail },
+        provenance,
+      );
+      break;
+    case 'output':
+      appendRunnerTelemetry(
+        'output',
+        { text: event.text, format: event.format ?? 'text', partial: event.partial ?? false },
+        provenance,
+      );
+      break;
+    case 'status':
+      appendRunnerTelemetry(
+        'agent.status',
+        { status: event.status, ...(event.activity ? { activity: event.activity } : {}) },
+        provenance,
+      );
+      break;
+    case 'activity':
+      appendRunnerTelemetry(
+        'agent.activity',
+        { label: event.label ?? 'provider activity', ...(event.status ? { status: event.status } : {}) },
+        provenance,
+      );
+      break;
+    case 'error':
+      appendRunnerTelemetry(
+        'error',
+        {
+          message: event.message,
+          retryable: event.retryable,
+          ...(event.classification ? { classification: event.classification } : {}),
+          ...(event.code ? { code: event.code } : {}),
+          ...event.detail,
+        },
+        provenance,
+      );
+      break;
+    default:
+      // Legacy result/progress/file/usage/init semantics remain unchanged and
+      // are not promoted to normalized monitor events in this boundary patch.
+      break;
+  }
+}
+
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
   switch (event.type) {
     case 'init':
@@ -837,7 +906,9 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       log(`File event: ${event.path}`);
       break;
     case 'usage':
-      log(`Usage: ${event.usage.totalTokens} total tokens (${event.usage.promptTokens} prompt / ${event.usage.completionTokens} completion)`);
+      log(
+        `Usage: ${event.usage.totalTokens} total tokens (${event.usage.promptTokens} prompt / ${event.usage.completionTokens} completion)`,
+      );
       break;
   }
 }

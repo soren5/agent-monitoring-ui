@@ -251,6 +251,18 @@ CREATE TABLE IF NOT EXISTS processing_ack (
   status_changed TEXT NOT NULL
 );
 
+-- Append-only structured provider telemetry. The container runner is the sole
+-- writer; the host only drains this table through a read-only connection.
+CREATE TABLE IF NOT EXISTS runner_telemetry (
+  id              TEXT PRIMARY KEY,
+  seq             INTEGER NOT NULL UNIQUE,
+  occurred_at     TEXT NOT NULL,
+  schema_version  INTEGER NOT NULL,
+  type            TEXT NOT NULL,
+  payload_json    TEXT NOT NULL,
+  provenance_json TEXT NOT NULL
+);
+
 -- Persistent key/value state owned by the container. Used (among other things)
 -- to store the SDK session ID so the agent's conversation resumes across
 -- container restarts. Cleared by /clear.

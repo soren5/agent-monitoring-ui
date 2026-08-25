@@ -41,7 +41,7 @@ export async function handleRepositoryAction(content: Record<string, unknown>, s
         session.agent_group_id,
         repository,
         String(content.branch),
-        typeof content.base === 'string' ? content.base : 'main',
+        typeof content.base === 'string' ? content.base : 'agent',
       );
     else if (op === 'repository.write_file') {
       await writeRepositoryFile(
@@ -60,7 +60,7 @@ export async function handleRepositoryAction(content: Record<string, unknown>, s
         String(content.head),
         String(content.title),
         String(content.body),
-        typeof content.base === 'string' ? content.base : 'main',
+        typeof content.base === 'string' ? content.base : 'agent',
       );
     else if (op === 'repository.merge_pr')
       result = await mergePullRequest(session.agent_group_id, repository, Number(content.pull_number));

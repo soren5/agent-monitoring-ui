@@ -34,6 +34,7 @@ export class MonitorPublisher extends EventEmitter {
   private readonly eventsById = new Map<string, MonitorEvent>();
   constructor(private readonly retention = 10_000) {
     super();
+    if (!Number.isSafeInteger(retention) || retention < 1) throw new Error('retention_must_be_positive_integer');
   }
   cursor(): Cursor {
     return { streamId: this.streamId, sequence: String(this.sequence) };
@@ -44,6 +45,9 @@ export class MonitorPublisher extends EventEmitter {
       asOf: this.cursor(),
       agents: [...this.agents.values()].sort((a, b) => a.agentGroupId.localeCompare(b.agentGroupId)),
     };
+  }
+  historyStats(): { retainedEvents: number; dedupeIds: number } {
+    return { retainedEvents: this.retained.length, dedupeIds: this.eventsById.size };
   }
   publish(
     type: MonitorEventType,
@@ -60,25 +64,47 @@ export class MonitorPublisher extends EventEmitter {
     const eventId = provenance.eventId ?? randomUUID();
     const duplicate = this.eventsById.get(eventId);
     if (duplicate) return duplicate;
-    this.sequence++;
-    const event = validateEvent(
-      redactSecrets({
-        protocolVersion: MONITOR_PROTOCOL_VERSION,
-        eventId,
-        cursor: this.cursor(),
-        timestamp: new Date().toISOString(),
-        type,
-        agentGroupId,
-        ...provenance,
-        payload,
-      }),
-    );
+    const nextSequence = this.sequence + 1n;
+    const event = validateEvent({
+      protocolVersion: MONITOR_PROTOCOL_VERSION,
+      eventId,
+      cursor: { streamId: this.streamId, sequence: String(nextSequence) },
+      timestamp: new Date().toISOString(),
+      type,
+      agentGroupId,
+      ...provenance,
+      payload: redactSecrets(payload),
+    });
+    if (this.startsNewSession(type, agentGroupId, provenance.sessionId)) this.clearHistory();
+    this.sequence = nextSequence;
     this.eventsById.set(eventId, event);
     this.project(event);
     this.retained.push(event);
-    while (this.retained.length > this.retention) this.retained.shift();
+    while (this.retained.length > this.retention) {
+      const evicted = this.retained.shift();
+      if (evicted) this.eventsById.delete(evicted.eventId);
+    }
     this.emit('event', event);
     return event;
+  }
+  private startsNewSession(
+    type: MonitorEventType,
+    agentGroupId: string | undefined,
+    sessionId: string | undefined,
+  ): boolean {
+    if (!agentGroupId) return false;
+    const current = this.agents.get(agentGroupId);
+    if (!current) return false;
+    if (type === 'agent.remove') return true;
+    return type === 'agent.upsert' && current.sessionId !== sessionId;
+  }
+  private clearHistory(): void {
+    // The stream cursor is global, so selectively removing one session could
+    // leave holes between other agents' events. Starting a contiguous suffix
+    // at the rollover boundary preserves resume/gap guarantees while ensuring
+    // no previous-session event remains available as monitor history.
+    this.retained.length = 0;
+    this.eventsById.clear();
   }
   resume(after?: Cursor): ResumeResult {
     if (!after) return { kind: 'snapshot', snapshot: this.snapshot(), reason: 'initial' };
@@ -112,17 +138,34 @@ export class MonitorPublisher extends EventEmitter {
       this.agents.set(e.agentGroupId, {
         ...old,
         status: e.payload.status as AgentProjection['status'],
-        hasBlockers: Boolean(e.payload.hasBlockers),
+        hasBlockers: typeof e.payload.hasBlockers === 'boolean' ? e.payload.hasBlockers : old.hasBlockers,
         updatedAt: e.timestamp,
       });
     else if (old && e.type === 'agent.activity')
-      this.agents.set(e.agentGroupId, { ...old, activity: String(e.payload.label ?? ''), updatedAt: e.timestamp });
+      this.agents.set(e.agentGroupId, {
+        ...old,
+        activity: String(e.payload.label ?? ''),
+        reasoningAvailability: isReasoningAvailability(e.payload.reasoning)
+          ? e.payload.reasoning
+          : old.reasoningAvailability,
+        updatedAt: e.timestamp,
+      });
+    else if (old && e.type === 'reasoning.progress' && isReasoningAvailability(e.payload.availability))
+      this.agents.set(e.agentGroupId, {
+        ...old,
+        reasoningAvailability: e.payload.availability,
+        updatedAt: e.timestamp,
+      });
   }
   static isDroppable(type: MonitorEventType): boolean {
     return (
       !NEVER_DROP.has(type) && (type === 'tool.progress' || type === 'reasoning.progress' || type === 'agent.activity')
     );
   }
+}
+
+function isReasoningAvailability(value: unknown): value is AgentProjection['reasoningAvailability'] {
+  return ['full', 'summary', 'activity_only', 'none', 'unknown'].includes(String(value));
 }
 
 export class ClientProjection {
@@ -169,7 +212,12 @@ export class ProgressCoalescer {
     agentGroupId: string | undefined,
     payload: Record<string, unknown>,
   ): MonitorEvent | undefined {
-    if (!MonitorPublisher.isDroppable(type)) return this.publisher.publish(type, agentGroupId, payload);
+    if (!MonitorPublisher.isDroppable(type)) {
+      // A critical event bypasses the delay, not the stream order: publish any
+      // older progress first, then the critical event immediately.
+      this.flush();
+      return this.publisher.publish(type, agentGroupId, payload);
+    }
     const key = `${type}:${agentGroupId ?? ''}`;
     const prior = this.pending.get(key);
     if (prior) {

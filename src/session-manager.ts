@@ -39,7 +39,14 @@ import {
   migrateMessagesInTable,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { emitRuntimeTelemetry } from './monitor/telemetry.js';
 import type { Session } from './types.js';
+
+function isExpectedFilesystemError(error: unknown): error is NodeJS.ErrnoException {
+  if (!(error instanceof Error)) return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return ['ENOENT', 'EACCES', 'EPERM', 'ELOOP', 'ENOTDIR', 'EBUSY'].includes(code ?? '');
+}
 
 /** Root directory for all session data. */
 export function sessionsBaseDir(): string {
@@ -303,7 +310,8 @@ function extractAttachmentFiles(
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(contentStr);
-  } catch {
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
     return contentStr;
   }
 
@@ -475,6 +483,7 @@ export function readOutboxFiles(
     }
     realOutboxDir = fs.realpathSync(outboxDir);
   } catch (err) {
+    if (!isExpectedFilesystemError(err)) throw err;
     log.warn('Failed to inspect outbox directory', { messageId, err });
     return undefined;
   }
@@ -499,7 +508,8 @@ export function readOutboxFiles(
         continue;
       }
       files.push({ filename, data: fs.readFileSync(realFilePath) });
-    } catch {
+    } catch (err) {
+      if (!isExpectedFilesystemError(err)) throw err;
       log.warn('Outbox file not found', { messageId, filename });
     }
   }
@@ -534,6 +544,7 @@ export function clearOutbox(agentGroupId: string, sessionId: string, messageId: 
     }
     fs.rmSync(realOutboxDir, { recursive: true, force: true });
   } catch (err) {
+    if (!isExpectedFilesystemError(err)) throw err;
     log.warn('Outbox cleanup failed (message already delivered)', { messageId, err });
   }
 }
@@ -546,6 +557,8 @@ export function markContainerRunning(sessionId: string): void {
 /** Mark a container as idle for a session. */
 export function markContainerIdle(sessionId: string): void {
   updateSession(sessionId, { container_status: 'idle' });
+  const session = getSession(sessionId);
+  if (session) emitRuntimeTelemetry('agent.status', session.agent_group_id, { status: 'idle' });
 }
 
 /** Mark a container as stopped for a session. */

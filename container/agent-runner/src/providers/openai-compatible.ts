@@ -7,7 +7,14 @@ import '../mcp-tools/interactive.js';
 import '../mcp-tools/agents.js';
 import '../mcp-tools/factory.js';
 import '../mcp-tools/repository.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange, ProviderOptions, QueryInput } from './types.js';
+import type {
+  AgentProvider,
+  AgentQuery,
+  ProviderEvent,
+  ProviderExchange,
+  ProviderOptions,
+  QueryInput,
+} from './types.js';
 
 // The host injects this fixed, non-secret endpoint only for this provider.
 // Keep the model list narrow: embedding models cannot produce chat completions,
@@ -19,7 +26,12 @@ const ALLOWED_MODELS = new Set(['google/gemma-4-12b-qat', 'qwen/qwen3.6-27b']);
 // available before selecting it for an agent.
 const DEFAULT_MODEL = 'google/gemma-4-12b-qat';
 
-type ChatMessage = { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_call_id?: string; tool_calls?: unknown[] };
+type ChatMessage = {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_call_id?: string;
+  tool_calls?: unknown[];
+};
 
 export class OpenAiCompatibleProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
@@ -61,7 +73,10 @@ export class OpenAiCompatibleProvider implements AgentProvider {
 
     const events: AsyncIterable<ProviderEvent> = {
       async *[Symbol.asyncIterator](): AsyncGenerator<ProviderEvent> {
+        const provenance = { provider: 'openai-compatible', model, sessionId: continuation };
         yield { type: 'init', continuation };
+        yield { type: 'capability', reasoning: 'none', toolProgress: true, provenance };
+        yield { type: 'status', status: 'starting', activity: 'OpenAI-compatible session initialized', provenance };
         while (!aborted) {
           while (pending.length === 0 && !ended && !aborted) {
             await new Promise<void>((resolve) => {
@@ -84,8 +99,16 @@ export class OpenAiCompatibleProvider implements AgentProvider {
           // the sweep sees fresh liveness until the fetch resolves.
           const heartbeatKeeper = setInterval(() => touchHeartbeat(), 20_000);
           try {
-            yield { type: 'activity' };
-            const tools = registeredTools().map((entry) => ({ type: 'function', function: { name: entry.tool.name, description: entry.tool.description, parameters: entry.tool.inputSchema } }));
+            yield { type: 'activity', label: 'OpenAI-compatible generation', status: 'in_progress', provenance };
+            yield { type: 'status', status: 'in_progress', activity: 'Generating response', provenance };
+            const tools = registeredTools().map((entry) => ({
+              type: 'function',
+              function: {
+                name: entry.tool.name,
+                description: entry.tool.description,
+                parameters: entry.tool.inputSchema,
+              },
+            }));
             // Bound the generation: local models (gemma-4-12b-qat) run at
             // ~8-10 tok/s, so an unconstrained completion can run for many
             // minutes and trip the runtime's fetch timeout. A generous cap
@@ -93,32 +116,119 @@ export class OpenAiCompatibleProvider implements AgentProvider {
             const response = await fetch(`${BASE_URL}/chat/completions`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ model, messages: history, tools, tool_choice: 'auto', stream: false, max_tokens: 2048 }),
+              body: JSON.stringify({
+                model,
+                messages: history,
+                tools,
+                tool_choice: 'auto',
+                stream: false,
+                max_tokens: 2048,
+              }),
               signal: controller.signal,
             });
-            if (!response.ok) throw new Error(`Local model request failed: HTTP ${response.status} ${await response.text()}`);
-            const body = (await response.json()) as { choices?: Array<{ message?: { content?: unknown; tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> } }> };
+            if (!response.ok)
+              throw new Error(`Local model request failed: HTTP ${response.status} ${await response.text()}`);
+            const body = (await response.json()) as {
+              choices?: Array<{
+                message?: {
+                  content?: unknown;
+                  tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>;
+                };
+              }>;
+              usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+            };
             const message = body.choices?.[0]?.message;
             const calls = message?.tool_calls ?? [];
             if (calls.length > 0) {
-              history.push({ role: 'assistant', content: typeof message?.content === 'string' ? message.content : '', tool_calls: calls });
-              for (const call of calls.slice(0, 8)) {
+              history.push({
+                role: 'assistant',
+                content: typeof message?.content === 'string' ? message.content : '',
+                tool_calls: calls,
+              });
+              for (const [callIndex, call] of calls.slice(0, 8).entries()) {
                 const name = call.function?.name ?? '';
+                const toolCallId = call.id || `${continuation}:tool:${history.length}:${callIndex}`;
+                const safeName = redactOpenAiCompatibleTelemetry(name).slice(0, 120) || 'tool';
+                yield {
+                  type: 'tool',
+                  phase: 'start',
+                  name: safeName,
+                  toolCallId,
+                  provenance: { ...provenance, itemId: toolCallId },
+                };
                 let args: Record<string, unknown> = {};
-                try { args = JSON.parse(call.function?.arguments ?? '{}') as Record<string, unknown>; } catch { /* tool gets a bounded invalid-arguments response */ }
-                const result = await callRegisteredTool(name, args);
-                history.push({ role: 'tool', tool_call_id: call.id ?? name, content: result.content.map((item) => item.type === 'text' ? item.text : '').join('\n') });
+                try {
+                  args = JSON.parse(call.function?.arguments ?? '{}') as Record<string, unknown>;
+                } catch {
+                  /* tool gets a bounded invalid-arguments response */
+                }
+                try {
+                  const result = await callRegisteredTool(name, args);
+                  history.push({
+                    role: 'tool',
+                    tool_call_id: toolCallId,
+                    content: result.content.map((item) => (item.type === 'text' ? item.text : '')).join('\n'),
+                  });
+                  yield {
+                    type: 'tool',
+                    phase: 'complete',
+                    name: safeName,
+                    toolCallId,
+                    detail: { status: 'completed' },
+                    provenance: { ...provenance, itemId: toolCallId },
+                  };
+                } catch (toolError) {
+                  const message = toolError instanceof Error ? toolError.message : String(toolError);
+                  history.push({ role: 'tool', tool_call_id: toolCallId, content: `Tool failed: ${message}` });
+                  yield {
+                    type: 'tool',
+                    phase: 'complete',
+                    name: safeName,
+                    toolCallId,
+                    detail: { status: 'failed', error: redactOpenAiCompatibleTelemetry(message) },
+                    provenance: { ...provenance, itemId: toolCallId },
+                  };
+                }
               }
               pending.unshift('Continue using the tool results above; do not repeat completed calls.');
               continue;
             }
             const text = message?.content;
-            if (typeof text !== 'string') throw new Error('Local model response did not contain choices[0].message.content');
+            if (typeof text !== 'string')
+              throw new Error('Local model response did not contain choices[0].message.content');
             history.push({ role: 'assistant', content: text });
+            if (body.usage) {
+              const promptTokens = safeTokenCount(body.usage.prompt_tokens);
+              const completionTokens = safeTokenCount(body.usage.completion_tokens);
+              yield {
+                type: 'usage',
+                usage: {
+                  promptTokens,
+                  completionTokens,
+                  totalTokens: safeTokenCount(body.usage.total_tokens) || promptTokens + completionTokens,
+                },
+              };
+            }
+            yield {
+              type: 'output',
+              text: redactOpenAiCompatibleTelemetry(text),
+              format: 'markdown',
+              partial: false,
+              provenance,
+            };
+            yield { type: 'status', status: 'idle', activity: 'Response completed', provenance };
             yield { type: 'result', text };
           } catch (err) {
             if (aborted) return;
-            yield { type: 'error', message: err instanceof Error ? err.message : String(err), retryable: true };
+            const message = err instanceof Error ? err.message : String(err);
+            yield {
+              type: 'error',
+              message: redactOpenAiCompatibleTelemetry(message),
+              retryable: true,
+              classification: classifyOpenAiCompatibleError(message),
+              provenance,
+            };
+            yield { type: 'status', status: 'failed', activity: 'OpenAI-compatible request failed', provenance };
           } finally {
             clearTimeout(fetchTimeout);
             clearInterval(heartbeatKeeper);
@@ -145,6 +255,24 @@ export class OpenAiCompatibleProvider implements AgentProvider {
       },
     };
   }
+}
+
+function safeTokenCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function classifyOpenAiCompatibleError(message: string): string | undefined {
+  if (/billing|credit|quota/i.test(message)) return 'quota';
+  if (/auth|api.?key|credential|unauthorized/i.test(message)) return 'auth';
+  if (/rate.?limit|timeout|temporar/i.test(message)) return 'rate_limit';
+  return undefined;
+}
+
+export function redactOpenAiCompatibleTelemetry(text: string): string {
+  return text
+    .replace(/(api[_-]?key|token|secret|password)(\s*[:=]\s*)[^\s,;]+/gi, '$1$2[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
+    .slice(0, 2_000);
 }
 
 registerProvider('openai-compatible', (options) => new OpenAiCompatibleProvider(options));

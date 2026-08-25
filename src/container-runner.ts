@@ -31,6 +31,7 @@ import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork, ensureLocalMode
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { getSession } from './db/sessions.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -53,6 +54,14 @@ import {
   writeSessionRouting,
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
+
+function isErrno(error: unknown, ...codes: string[]): error is NodeJS.ErrnoException {
+  return error instanceof Error && codes.includes((error as NodeJS.ErrnoException).code ?? '');
+}
+
+function isChildProcessFailure(error: unknown): boolean {
+  return error instanceof Error && ('status' in error || 'signal' in error);
+}
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
@@ -161,7 +170,7 @@ async function spawnContainer(session: Session): Promise<void> {
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
-  emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'starting', hasBlockers: false });
+  emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'starting' });
 
   // Clear any orphan heartbeat from a previous container instance — the
   // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
@@ -173,7 +182,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   activeContainers.set(session.id, { process: container, containerName });
   markContainerRunning(session.id);
-  emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'in_progress', hasBlockers: false });
+  emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'in_progress' });
 
   // Log stderr. A container that dies at boot (unknown provider, missing
   // binary, bad config) explains itself only here — and debug is below the
@@ -202,11 +211,11 @@ async function spawnContainer(session: Session): Promise<void> {
     stopTypingRefresh(session.id);
     // code null = killed by signal (normal shutdown path), not a boot failure.
     if (code !== 0 && code !== null && stderrTail.length > 0) {
-      emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'failed', hasBlockers: false });
+      emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'failed' });
       emitRuntimeTelemetry('error', agentGroup.id, { message: 'container_exited_nonzero', code });
       log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });
     } else {
-      emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'stopped', hasBlockers: false });
+      emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'stopped' });
       log.info('Container exited', { sessionId: session.id, code, containerName });
     }
   });
@@ -216,7 +225,7 @@ async function spawnContainer(session: Session): Promise<void> {
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     log.error('Container spawn error', { sessionId: session.id, err });
-    emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'failed', hasBlockers: false });
+    emitRuntimeTelemetry('agent.status', agentGroup.id, { status: 'failed' });
     emitRuntimeTelemetry('error', agentGroup.id, { message: err.message });
   });
 }
@@ -231,9 +240,12 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
   }
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  const session = getSession(sessionId);
+  if (session) emitRuntimeTelemetry('agent.status', session.agent_group_id, { status: 'stopping' });
   try {
     stopContainer(entry.containerName);
-  } catch {
+  } catch (err) {
+    if (!isChildProcessFailure(err)) throw err;
     entry.process.kill('SIGKILL');
   }
 }
@@ -410,7 +422,8 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
     let isSymlink = false;
     try {
       isSymlink = fs.lstatSync(entryPath).isSymbolicLink();
-    } catch {
+    } catch (err) {
+      if (!isErrno(err, 'ENOENT')) throw err;
       continue;
     }
     if (isSymlink && !desiredSet.has(entry)) {
@@ -424,7 +437,8 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
     let entry: fs.Stats | undefined;
     try {
       entry = fs.lstatSync(linkPath);
-    } catch {
+    } catch (err) {
+      if (!isErrno(err, 'ENOENT')) throw err;
       /* missing */
     }
     if (!entry) {
@@ -456,7 +470,8 @@ function selectedSkillNames(containerConfig: import('./container-config.js').Con
     ? fs.readdirSync(sharedSkillsDir).filter((e) => {
         try {
           return fs.statSync(path.join(sharedSkillsDir, e)).isDirectory();
-        } catch {
+        } catch (err) {
+          if (!isErrno(err, 'ENOENT')) throw err;
           return false;
         }
       })
@@ -592,7 +607,8 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   try {
     const { stdout } = await execAsync(`${CONTAINER_RUNTIME_BIN} image inspect --format '{{.Id}}' ${CONTAINER_IMAGE}`);
     baseId = stdout.trim();
-  } catch {
+  } catch (err) {
+    if (!isChildProcessFailure(err)) throw err;
     // Non-fatal: the build below fails on its own if the base is really absent.
   }
 

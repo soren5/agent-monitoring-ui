@@ -111,6 +111,15 @@ export function getOutboundDb(): Database {
         tool_started_at          TEXT,
         updated_at               TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS runner_telemetry (
+        id            TEXT PRIMARY KEY,
+        seq           INTEGER NOT NULL UNIQUE,
+        occurred_at   TEXT NOT NULL,
+        schema_version INTEGER NOT NULL,
+        type          TEXT NOT NULL,
+        payload_json  TEXT NOT NULL,
+        provenance_json TEXT NOT NULL
+      );
     `);
   }
   return _outbound;
@@ -251,6 +260,11 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       tool_declared_timeout_ms INTEGER,
       tool_started_at          TEXT,
       updated_at               TEXT NOT NULL
+    );
+    CREATE TABLE runner_telemetry (
+      id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, occurred_at TEXT NOT NULL,
+      schema_version INTEGER NOT NULL, type TEXT NOT NULL, payload_json TEXT NOT NULL,
+      provenance_json TEXT NOT NULL
     );
   `);
 

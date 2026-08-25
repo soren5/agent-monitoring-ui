@@ -27,7 +27,12 @@ const BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1';
 const ALLOWED_MODELS = new Set(['deepseek-v4-flash']);
 const DEFAULT_MODEL = 'deepseek-v4-flash';
 
-type ChatMessage = { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_call_id?: string; tool_calls?: unknown[] };
+type ChatMessage = {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_call_id?: string;
+  tool_calls?: unknown[];
+};
 
 /** Structural mirror of the shared memory hook registration (memory/session-hook.ts). */
 interface DeepSeekMemorySessionHook {
@@ -89,9 +94,7 @@ export class DeepSeekProvider implements AgentProvider {
     const systemInstructions = memory
       ? `${memory}\n\n${input.systemContext?.instructions ?? ''}`.trim()
       : input.systemContext?.instructions;
-    const history: ChatMessage[] = systemInstructions
-      ? [{ role: 'system', content: systemInstructions }]
-      : [];
+    const history: ChatMessage[] = systemInstructions ? [{ role: 'system', content: systemInstructions }] : [];
     // Per-turn usage accumulator, reset on each query(). Summed across every
     // chat-completions round of the turn (tool calls included), then emitted
     // as one aggregated `usage` event right before the result.
@@ -109,7 +112,12 @@ export class DeepSeekProvider implements AgentProvider {
 
     const events: AsyncIterable<ProviderEvent> = {
       async *[Symbol.asyncIterator](): AsyncGenerator<ProviderEvent> {
+        const provenance = { provider: 'deepseek', model, sessionId: continuation };
         yield { type: 'init', continuation };
+        // This endpoint is non-streaming and never returns reasoning text. A
+        // positive reasoning-token count can prove activity, but not content.
+        yield { type: 'capability', reasoning: 'unknown', toolProgress: true, provenance };
+        yield { type: 'status', status: 'starting', activity: 'DeepSeek session initialized', provenance };
         while (!aborted) {
           while (pending.length === 0 && !ended && !aborted) {
             await new Promise<void>((resolve) => {
@@ -122,10 +130,15 @@ export class DeepSeekProvider implements AgentProvider {
           history.push({ role: 'user', content: prompt.text });
           controller = new AbortController();
           try {
-            yield { type: 'activity' };
+            yield { type: 'activity', label: 'DeepSeek generation', status: 'in_progress', provenance };
+            yield { type: 'status', status: 'in_progress', activity: 'Generating response', provenance };
             const tools = registeredTools().map((entry) => ({
               type: 'function',
-              function: { name: entry.tool.name, description: entry.tool.description, parameters: entry.tool.inputSchema },
+              function: {
+                name: entry.tool.name,
+                description: entry.tool.description,
+                parameters: entry.tool.inputSchema,
+              },
             }));
             const response = await fetch(`${BASE_URL}/chat/completions`, {
               method: 'POST',
@@ -133,10 +146,14 @@ export class DeepSeekProvider implements AgentProvider {
               body: JSON.stringify({ model, messages: history, tools, tool_choice: 'auto', stream: false }),
               signal: controller.signal,
             });
-            if (!response.ok) throw new Error(`DeepSeek request failed: HTTP ${response.status} ${await response.text()}`);
+            if (!response.ok)
+              throw new Error(`DeepSeek request failed: HTTP ${response.status} ${await response.text()}`);
             const body = (await response.json()) as {
               choices?: Array<{
-                message?: { content?: unknown; tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> };
+                message?: {
+                  content?: unknown;
+                  tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>;
+                };
               }>;
               usage?: {
                 prompt_tokens?: number;
@@ -156,6 +173,13 @@ export class DeepSeekProvider implements AgentProvider {
                   (turnUsage?.reasoningTokens ?? 0) + (usage.completion_tokens_details?.reasoning_tokens ?? 0),
                 totalTokens: (turnUsage?.totalTokens ?? 0) + usage.total_tokens,
               };
+              if ((usage.completion_tokens_details?.reasoning_tokens ?? 0) > 0) {
+                yield {
+                  type: 'reasoning',
+                  availability: 'activity_only',
+                  provenance,
+                };
+              }
             }
             const message = body.choices?.[0]?.message;
             const calls = message?.tool_calls ?? [];
@@ -165,33 +189,81 @@ export class DeepSeekProvider implements AgentProvider {
                 content: typeof message?.content === 'string' ? message.content : '',
                 tool_calls: calls,
               });
-              for (const call of calls.slice(0, 8)) {
+              for (const [callIndex, call] of calls.slice(0, 8).entries()) {
                 const name = call.function?.name ?? '';
+                const toolCallId = call.id || `${continuation}:tool:${history.length}:${callIndex}`;
+                const safeName = redactDeepSeekTelemetry(name).slice(0, 120) || 'tool';
+                yield {
+                  type: 'tool',
+                  phase: 'start',
+                  name: safeName,
+                  toolCallId,
+                  provenance: { ...provenance, itemId: toolCallId },
+                };
                 let args: Record<string, unknown> = {};
                 try {
                   args = JSON.parse(call.function?.arguments ?? '{}') as Record<string, unknown>;
                 } catch {
                   /* tool gets a bounded invalid-arguments response */
                 }
-                const result = await callRegisteredTool(name, args);
-                history.push({
-                  role: 'tool',
-                  tool_call_id: call.id ?? name,
-                  content: result.content.map((item) => (item.type === 'text' ? item.text : '')).join('\n'),
-                });
+                try {
+                  const result = await callRegisteredTool(name, args);
+                  const toolFailed = (result as { isError?: boolean }).isError === true;
+                  history.push({
+                    role: 'tool',
+                    tool_call_id: toolCallId,
+                    content: result.content.map((item) => (item.type === 'text' ? item.text : '')).join('\n'),
+                  });
+                  yield {
+                    type: 'tool',
+                    phase: 'complete',
+                    name: safeName,
+                    toolCallId,
+                    detail: { status: toolFailed ? 'failed' : 'completed' },
+                    provenance: { ...provenance, itemId: toolCallId },
+                  };
+                } catch (toolError) {
+                  const message = toolError instanceof Error ? toolError.message : String(toolError);
+                  history.push({ role: 'tool', tool_call_id: toolCallId, content: `Tool failed: ${message}` });
+                  yield {
+                    type: 'tool',
+                    phase: 'complete',
+                    name: safeName,
+                    toolCallId,
+                    detail: { status: 'failed', error: redactDeepSeekTelemetry(message) },
+                    provenance: { ...provenance, itemId: toolCallId },
+                  };
+                }
               }
               pending.unshift({ text: 'Continue using the tool results above; do not repeat completed calls.' });
               continue;
             }
             const text = message?.content;
-            if (typeof text !== 'string') throw new Error('DeepSeek response did not contain choices[0].message.content');
+            if (typeof text !== 'string')
+              throw new Error('DeepSeek response did not contain choices[0].message.content');
             history.push({ role: 'assistant', content: text });
             if (turnUsage) yield { type: 'usage', usage: turnUsage };
+            yield {
+              type: 'output',
+              text: redactDeepSeekTelemetry(text),
+              format: 'markdown',
+              partial: false,
+              provenance,
+            };
+            yield { type: 'status', status: 'idle', activity: 'Response completed', provenance };
             yield { type: 'result', text };
             turnUsage = undefined;
           } catch (err) {
             if (aborted) return;
-            yield { type: 'error', message: err instanceof Error ? err.message : String(err), retryable: true };
+            const message = err instanceof Error ? err.message : String(err);
+            yield {
+              type: 'error',
+              message: redactDeepSeekTelemetry(message),
+              retryable: true,
+              classification: classifyDeepSeekError(message),
+              provenance,
+            };
+            yield { type: 'status', status: 'failed', activity: 'DeepSeek request failed', provenance };
           } finally {
             controller = null;
           }
@@ -216,6 +288,20 @@ export class DeepSeekProvider implements AgentProvider {
       },
     };
   }
+}
+
+function classifyDeepSeekError(message: string): string | undefined {
+  if (/billing|credit|quota/i.test(message)) return 'quota';
+  if (/auth|api.?key|credential|unauthorized/i.test(message)) return 'auth';
+  if (/rate.?limit|timeout|temporar/i.test(message)) return 'rate_limit';
+  return undefined;
+}
+
+export function redactDeepSeekTelemetry(text: string): string {
+  return text
+    .replace(/(api[_-]?key|token|secret|password)(\s*[:=]\s*)[^\s,;]+/gi, '$1$2[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
+    .slice(0, 2_000);
 }
 
 registerProvider('deepseek', (options) => new DeepSeekProvider(options));

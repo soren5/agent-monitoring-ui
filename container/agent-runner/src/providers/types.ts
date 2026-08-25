@@ -135,6 +135,29 @@ export interface AgentQuery {
   abort(): void;
 }
 
+export interface ProviderEventProvenance {
+  provider?: string;
+  model?: string;
+  sessionId?: string;
+  turnId?: string;
+  itemId?: string;
+}
+
+type NormalizedProviderEvent =
+  | { type: 'activity'; label?: string; status?: ProviderStatus }
+  | { type: 'reasoning'; content?: string; availability?: ReasoningAvailability }
+  | { type: 'capability'; reasoning: ReasoningAvailability; toolProgress: boolean }
+  | {
+      type: 'tool';
+      phase: 'start' | 'progress' | 'complete';
+      name: string;
+      toolCallId?: string;
+      detail?: Record<string, unknown>;
+      provenance?: ProviderEventProvenance;
+    }
+  | { type: 'output'; text: string; format?: 'text' | 'markdown' | 'json'; partial?: boolean }
+  | { type: 'status'; status: ProviderStatus; activity?: string };
+
 export type ProviderEvent =
   | { type: 'init'; continuation: string }
   /**
@@ -144,7 +167,15 @@ export type ProviderEvent =
    * dropping it as un-wrapped scratchpad, and to skip the re-wrap nudge.
    */
   | { type: 'result'; text: string | null; isError?: boolean }
-  | { type: 'error'; message: string; retryable: boolean; classification?: string }
+  | {
+      type: 'error';
+      message: string;
+      retryable: boolean;
+      classification?: string;
+      code?: string;
+      detail?: Record<string, unknown>;
+      provenance?: ProviderEventProvenance;
+    }
   | { type: 'progress'; message: string }
   /**
    * Provider-generated file artifact. Codex emits this for generated images
@@ -162,7 +193,19 @@ export type ProviderEvent =
    * event (tool call, thinking, partial message, anything) so the
    * poll-loop's idle timer stays honest during long tool runs.
    */
-  | { type: 'activity' };
+  | (NormalizedProviderEvent & { provenance?: ProviderEventProvenance });
+
+export type ReasoningAvailability = 'full' | 'summary' | 'activity_only' | 'none' | 'unknown';
+export type ProviderStatus =
+  | 'starting'
+  | 'idle'
+  | 'in_progress'
+  | 'blocked'
+  | 'waiting'
+  | 'stopping'
+  | 'stopped'
+  | 'failed'
+  | 'unknown';
 
 /**
  * Token usage as reported by a provider's own response. `totalTokens` is the
