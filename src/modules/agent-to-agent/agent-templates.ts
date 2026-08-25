@@ -63,7 +63,7 @@ const templates: Record<string, AgentTemplate> = {
     mergePolicy: 'disabled',
     harness: 'implementation',
     instructionBase:
-      'You are a constrained Codex-backed implementation agent. Work only within your assigned project scope.',
+      'You are a constrained Codex-backed implementation agent. Work only within your assigned project scope. By the end of your turn you are expected to have produced the implementation changes for the task — concrete edits in the checkout (and tests where applicable), not merely a plan or analysis. You may spend as long as you need planning and designing first; just make sure the turn ends with the actual implementation done.',
   },
   deepseek: {
     id: 'deepseek',
@@ -82,7 +82,7 @@ const templates: Record<string, AgentTemplate> = {
     mergePolicy: 'disabled',
     harness: 'implementation',
     instructionBase:
-      'You are a constrained DeepSeek-backed implementation agent. Work only within your assigned project scope.',
+      'You are a constrained DeepSeek-backed implementation agent. Work only within your assigned project scope. By the end of your turn you are expected to have produced the implementation changes for the task — concrete edits in the checkout (and tests where applicable), not merely a plan or analysis. You may spend as long as you need planning and designing first; just make sure the turn ends with the actual implementation done.',
   },
   junior: {
     id: 'junior',
@@ -95,7 +95,8 @@ const templates: Record<string, AgentTemplate> = {
     smokeTestId: 'basic-agent-message',
     repositoryActions: repositoryCoding,
     mergePolicy: 'disabled',
-    instructionBase: 'You are a constrained junior implementation agent. Report findings to your parent.',
+    instructionBase:
+      'You are a constrained junior implementation agent. Report findings to your parent. By the end of your turn you are expected to have produced the implementation changes for the task — concrete edits in the checkout (and tests where applicable), not merely a plan or analysis. You may spend as long as you need planning and designing first; just make sure the turn ends with the actual implementation done.',
   },
   'local-coding': {
     id: 'local-coding',
@@ -108,7 +109,8 @@ const templates: Record<string, AgentTemplate> = {
     smokeTestId: 'basic-agent-message',
     repositoryActions: repositoryCoding,
     mergePolicy: 'disabled',
-    instructionBase: 'You are a constrained local coding agent. Work only on bounded tasks from your parent.',
+    instructionBase:
+      'You are a constrained local coding agent. Work only on bounded tasks from your parent. By the end of your turn you are expected to have produced the implementation changes for the task — concrete edits in the checkout (and tests where applicable), not merely a plan or analysis. You may spend as long as you need planning and designing first; just make sure the turn ends with the actual implementation done.',
   },
   'local-test': {
     id: 'local-test',
