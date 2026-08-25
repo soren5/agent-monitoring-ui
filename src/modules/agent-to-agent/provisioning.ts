@@ -73,6 +73,7 @@ type ProvisionRow = {
   requested_actions_json: string;
   instruction_overlay: string;
   repository_id: string | null;
+  repository_branch_prefix: string | null;
   channel_type: string | null;
   platform_id: string | null;
   channel_mode: string | null;
@@ -202,6 +203,7 @@ type ProvisionPayload = {
   actions: string[];
   overlay: string;
   repositoryId: string | null;
+  repositoryBranchPrefix: string | null;
   channelType: string | null;
   platformId: string | null;
   channelMode: string | null;
@@ -221,6 +223,7 @@ function requestPayload(content: Record<string, unknown>, session: Session): Pro
         'project_id',
         'project_bootstrap',
         'repository_id',
+        'repository_branch_prefix',
         'channel_binding',
       ].includes(key),
     )
@@ -243,6 +246,8 @@ function requestPayload(content: Record<string, unknown>, session: Session): Pro
   const projectBootstrapId = typeof bootstrapObject?.project_id === 'string' ? bootstrapObject.project_id : null;
   const bootstrapPlatformId = typeof bootstrapObject?.platform_id === 'string' ? bootstrapObject.platform_id : null;
   const repositoryId = typeof content.repository_id === 'string' ? content.repository_id : null;
+  const repositoryBranchPrefix =
+    typeof content.repository_branch_prefix === 'string' ? content.repository_branch_prefix.trim() : null;
   const channel = content.channel_binding;
   const channelObject =
     channel && typeof channel === 'object' && !Array.isArray(channel)
@@ -268,6 +273,12 @@ function requestPayload(content: Record<string, unknown>, session: Session): Pro
     return { error: "requested_actions exceeds the parent's live template authority." };
   if (repositoryId !== null && !REPOSITORY_ID.test(repositoryId))
     return { error: 'repository_id must be owner/repository.' };
+  if (repositoryBranchPrefix !== null) {
+    if (!repositoryId) return { error: 'repository_branch_prefix requires repository_id.' };
+    const bad = /[\s\\~^:?*\[@{]|\.[.]|^\.|^\/|\.lock$|[-.]$/.test(repositoryBranchPrefix);
+    if (!repositoryBranchPrefix || repositoryBranchPrefix.length > 128 || bad || repositoryBranchPrefix.startsWith('-'))
+      return { error: 'repository_branch_prefix is not a valid branch prefix.' };
+  }
   if (bootstrap !== undefined) {
     if (!bootstrapObject || !Object.keys(bootstrapObject).every((key) => ['project_id', 'platform_id'].includes(key)))
       return { error: 'project_bootstrap must contain only project_id and platform_id.' };
@@ -318,6 +329,7 @@ function requestPayload(content: Record<string, unknown>, session: Session): Pro
       actions,
       overlay,
       repositoryId,
+      repositoryBranchPrefix,
       channelType,
       platformId,
       channelMode,
@@ -344,8 +356,8 @@ export async function requestAgentProvision(content: Record<string, unknown>, se
   getDb()
     .prepare(
       `INSERT INTO agent_provision_requests
-     (request_id, parent_agent_group_id, project_id, project_bootstrap_id, template_id, template_revision, display_name, normalized_name, requested_actions_json, instruction_overlay, repository_id, channel_type, platform_id, channel_mode, state, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+     (request_id, parent_agent_group_id, project_id, project_bootstrap_id, template_id, template_revision, display_name, normalized_name, requested_actions_json, instruction_overlay, repository_id, repository_branch_prefix, channel_type, platform_id, channel_mode, state, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
     )
     .run(
       requestId,
@@ -359,6 +371,7 @@ export async function requestAgentProvision(content: Record<string, unknown>, se
       JSON.stringify(parsed.actions),
       parsed.overlay,
       parsed.repositoryId,
+      parsed.repositoryBranchPrefix,
       parsed.projectBootstrapId ? 'discord' : parsed.channelType,
       parsed.projectBootstrapId ? parsed.projectBootstrapPlatformId : parsed.platformId,
       parsed.projectBootstrapId ? 'project-parent' : parsed.channelMode,
@@ -538,14 +551,21 @@ async function materialize(request: ProvisionRow, session: Session, approvalId: 
         const parentPrefixes = new Map<string, string>();
         for (const action of template.repositoryActions) {
           // A parent's repository authority comes from its own grants,
-          // whether it is a root or a descendant. A root with explicit grants
-          // (e.g. an owner-granted implementation prefix) delegates that exact
-          // prefix to its children; a root or descendant without them falls
-          // back to a derived per-child namespace.
+          // whether it is a root or a descendant. When the parent declares a
+          // target branch prefix in the provisioning request, that prefix is
+          // passed as a constraint so `findEffectiveGrant` selects the exact
+          // grant that authorizes it (a parent may hold several grants for the
+          // same repository) instead of arbitrarily picking the first. A root
+          // with no matching grant falls back to a derived per-child
+          // namespace; a descendant without one fails delegation below.
+          const requested = request.repository_branch_prefix;
           const parentGrant = findEffectiveGrant(parent.id, {
             resourceType: 'repository',
             resourceId: request.repository_id,
             action,
+            ...(requested
+              ? { constraints: action === 'pr-create' ? { head_prefix: requested } : { branch_prefix: requested } }
+              : {}),
           });
           const constraints = parentGrant ? (JSON.parse(parentGrant.constraints_json) as Record<string, unknown>) : {};
           const parentPrefix =
@@ -556,7 +576,7 @@ async function materialize(request: ProvisionRow, session: Session, approvalId: 
               : typeof constraints.branch_prefix === 'string'
                 ? constraints.branch_prefix
                 : null;
-          const prefix = parentPrefix ?? `nanoclaw/${groupId}/`;
+          const prefix = requested && parentGrant ? requested : (parentPrefix ?? `nanoclaw/${groupId}/`);
           // A nested child must be strictly narrower than its parent's branch
           // namespace; a root without grants derives its own namespace, and a
           // root WITH grants passes its exact prefix down unchanged.

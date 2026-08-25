@@ -56,4 +56,15 @@ describe('capability attenuation', () => {
       delegateGrant('parent', 'child', { resourceType: 'repository', resourceId: repo, action: 'pr-create' }),
     ).toThrow(/lacks/);
   });
+  it('lets an unconstrained grant cover a narrower constrained request', () => {
+    issueRootGrant('parent', { resourceType: 'repository', resourceId: repo, action: 'read' }, 'owner');
+    expect(
+      findEffectiveGrant('parent', {
+        resourceType: 'repository',
+        resourceId: repo,
+        action: 'read',
+        constraints: { branch_prefix: 'feature/m1-agent-monitor-events' },
+      }),
+    ).toBeDefined();
+  });
 });
