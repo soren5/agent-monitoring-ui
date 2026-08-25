@@ -56,6 +56,25 @@ function authFile(refresh: string): string {
     {
       auth_mode: 'chatgpt',
       OPENAI_API_KEY: null,
+      tokens: {
+        access_token: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.sig',
+        refresh_token: 'rt.1.abcdefghijklmnop',
+        id_token: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.id',
+        account_id: 'e5ec5e49-28c7-40d0-a1f1-9f8990',
+      },
+      last_refresh: refresh,
+    },
+    null,
+    2,
+  );
+}
+
+/** The sentinel skeleton `codex login` leaves when the flow never completes. */
+function placeholderFile(refresh: string): string {
+  return JSON.stringify(
+    {
+      auth_mode: 'chatgpt',
+      OPENAI_API_KEY: null,
       tokens: { access_token: 'at', refresh_token: 'rt', id_token: 'it', account_id: 'acct' },
       last_refresh: refresh,
     },
@@ -135,6 +154,16 @@ describe('syncCodexAuthIfNewer', () => {
   });
 
   it('returns false when the auth file is absent', async () => {
+    expect(await syncCodexAuthIfNewer()).toBe(false);
+    const patchCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes(SECRET_ID));
+    expect(patchCalls).toHaveLength(0);
+  });
+
+  it('never pushes a login placeholder skeleton over a valid vault token', async () => {
+    // A placeholder file that is newer than the last pushed refresh must still
+    // be refused — otherwise it would clobber the good vault credential.
+    fs.writeFileSync(CODEX_AUTH_PATH, placeholderFile('2099-01-01T00:00:00.000Z'));
+
     expect(await syncCodexAuthIfNewer()).toBe(false);
     const patchCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes(SECRET_ID));
     expect(patchCalls).toHaveLength(0);
