@@ -9,8 +9,8 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// vi.mock factories are hoisted above imports and can't close over local consts.
-// Use vi.hoisted to compute paths at module scope.
+// Compute test paths at module scope via vi.hoisted (vi.mock factories are
+// hoisted and can't close over local consts).
 const paths = vi.hoisted(() => {
   const nodePath = require('path') as typeof import('path');
   const nodeOs = require('os') as typeof import('os');
@@ -33,11 +33,6 @@ vi.mock('./config.js', async () => {
   };
 });
 
-vi.mock('os', async () => {
-  const actual = await vi.importActual<typeof import('os')>('os');
-  return { ...actual, homedir: () => paths.home };
-});
-
 vi.mock('./log.js', () => ({
   log: {
     debug: vi.fn(),
@@ -47,7 +42,7 @@ vi.mock('./log.js', () => ({
   },
 }));
 
-import { CODEX_AUTH_PATH, syncCodexAuthIfNewer } from './onecli-codex-sync.js';
+import { codexAuthPath, syncCodexAuthIfNewer } from './onecli-codex-sync.js';
 
 const SECRET_ID = '70216f57-8dcc-4356-ada8-f9551ba5a06d';
 
@@ -86,11 +81,13 @@ function placeholderFile(refresh: string): string {
 let fetchMock: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
-  fs.mkdirSync(path.dirname(CODEX_AUTH_PATH), { recursive: true });
+  // Point the sync at a temp auth file. Never touch the real ~/.codex/auth.json.
+  process.env.NANOCLAW_CODEX_AUTH_PATH = paths.authPath;
+  fs.mkdirSync(path.dirname(codexAuthPath()), { recursive: true });
   fs.mkdirSync(paths.data, { recursive: true });
   // Fresh state marker + auth file each test — no prior push or file lingering.
   fs.rmSync(path.join(paths.data, 'onecli-codex-sync-state.json'), { force: true });
-  fs.rmSync(CODEX_AUTH_PATH, { force: true });
+  fs.rmSync(codexAuthPath(), { force: true });
 
   fetchMock = vi.fn(async (url: string) => {
     const listUrl = `http://127.0.0.1:10254/api/secrets`;
@@ -111,6 +108,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  delete process.env.NANOCLAW_CODEX_AUTH_PATH;
   fs.rmSync(paths.home, { recursive: true, force: true });
   fs.rmSync(paths.data, { recursive: true, force: true });
 });
@@ -118,7 +116,7 @@ afterEach(() => {
 describe('syncCodexAuthIfNewer', () => {
   it('pushes a fresh auth file into the vault', async () => {
     const refresh = '2026-08-14T05:51:34.583569Z';
-    fs.writeFileSync(CODEX_AUTH_PATH, authFile(refresh));
+    fs.writeFileSync(codexAuthPath(), authFile(refresh));
 
     const result = await syncCodexAuthIfNewer();
 
@@ -133,7 +131,7 @@ describe('syncCodexAuthIfNewer', () => {
 
   it('does not push again when the marker already matches', async () => {
     const refresh = '2026-08-14T05:51:34.583569Z';
-    fs.writeFileSync(CODEX_AUTH_PATH, authFile(refresh));
+    fs.writeFileSync(codexAuthPath(), authFile(refresh));
     expect(await syncCodexAuthIfNewer()).toBe(true);
 
     // No file change → no second push.
@@ -146,10 +144,10 @@ describe('syncCodexAuthIfNewer', () => {
   it('pushes again when last_refresh advances', async () => {
     const first = '2026-08-14T05:51:34.583569Z';
     const second = '2026-08-15T05:51:34.583569Z';
-    fs.writeFileSync(CODEX_AUTH_PATH, authFile(first));
+    fs.writeFileSync(codexAuthPath(), authFile(first));
     expect(await syncCodexAuthIfNewer()).toBe(true);
 
-    fs.writeFileSync(CODEX_AUTH_PATH, authFile(second));
+    fs.writeFileSync(codexAuthPath(), authFile(second));
     expect(await syncCodexAuthIfNewer()).toBe(true);
   });
 
@@ -162,7 +160,7 @@ describe('syncCodexAuthIfNewer', () => {
   it('never pushes a login placeholder skeleton over a valid vault token', async () => {
     // A placeholder file that is newer than the last pushed refresh must still
     // be refused — otherwise it would clobber the good vault credential.
-    fs.writeFileSync(CODEX_AUTH_PATH, placeholderFile('2099-01-01T00:00:00.000Z'));
+    fs.writeFileSync(codexAuthPath(), placeholderFile('2099-01-01T00:00:00.000Z'));
 
     expect(await syncCodexAuthIfNewer()).toBe(false);
     const patchCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes(SECRET_ID));
@@ -171,7 +169,7 @@ describe('syncCodexAuthIfNewer', () => {
 
   it('does not push when the vault secrets list fails', async () => {
     fetchMock.mockImplementationOnce(async () => ({ ok: false, status: 500, json: async () => ({}) }));
-    fs.writeFileSync(CODEX_AUTH_PATH, authFile('2026-08-14T05:51:34.583569Z'));
+    fs.writeFileSync(codexAuthPath(), authFile('2026-08-14T05:51:34.583569Z'));
 
     expect(await syncCodexAuthIfNewer()).toBe(false);
   });
@@ -183,7 +181,7 @@ describe('syncCodexAuthIfNewer', () => {
       }
       return { ok: false, status: 404, json: async () => ({}) };
     });
-    fs.writeFileSync(CODEX_AUTH_PATH, authFile('2026-08-14T05:51:34.583569Z'));
+    fs.writeFileSync(codexAuthPath(), authFile('2026-08-14T05:51:34.583569Z'));
 
     expect(await syncCodexAuthIfNewer()).toBe(false);
   });
