@@ -219,7 +219,9 @@ export class DeepSeekProvider implements AgentProvider {
                     phase: 'complete',
                     name: safeName,
                     toolCallId,
-                    detail: { status: toolFailed ? 'failed' : 'completed' },
+                    detail: toolFailed
+                      ? { status: 'failed', error: 'Tool reported an error' }
+                      : { status: 'completed' },
                     provenance: { ...provenance, itemId: toolCallId },
                   };
                 } catch (toolError) {
