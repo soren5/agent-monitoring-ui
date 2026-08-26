@@ -567,6 +567,7 @@ function codexActivityLabel(method: string): string {
 }
 
 function mapCodexStatus(status: string): 'idle' | 'in_progress' | 'blocked' | 'failed' | 'unknown' {
+  if (typeof status !== 'string') return 'unknown';
   const normalized = status.toLowerCase();
   if (normalized.includes('idle')) return 'idle';
   if (normalized.includes('active') || normalized.includes('running')) return 'in_progress';

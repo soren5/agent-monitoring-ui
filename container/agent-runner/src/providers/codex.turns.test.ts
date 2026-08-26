@@ -261,6 +261,30 @@ describe('CodexProvider active turns', () => {
     ).toBe(true);
   });
 
+  it('tolerates a non-string status in thread/status/changed without crashing the provider', async () => {
+    const fake = createFakeCodexRuntime();
+    const provider = createCodexProvider({ model: 'gpt-5.5' }, fake.runtime);
+    const query = provider.query({ prompt: 'prompt', cwd: '/workspace/agent' });
+    const events: ProviderEvent[] = [];
+    const collect = collectEvents(query.events, events);
+    await waitFor(() => fake.startCalls.length === 1);
+
+    // codex may emit a numeric/object status; mapCodexStatus must not throw.
+    fake.notifyFixture({
+      method: 'thread/status/changed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', status: 3 },
+    });
+    fake.notifyFixture({
+      method: 'thread/status/changed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', status: { value: 'idle' } },
+    });
+    query.end();
+    fake.completeTurn('answer');
+    await collect;
+
+    expect(events.some((event) => event.type === 'result')).toBe(true);
+  });
+
   it('emits none when reasoning is configured unavailable', async () => {
     const fake = createFakeCodexRuntime();
     const provider = createCodexProvider({ effort: 'none' }, fake.runtime);
