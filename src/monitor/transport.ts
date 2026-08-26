@@ -33,6 +33,10 @@ export interface MonitorTransportOptions {
   rateWindowMs?: number;
   maxFramesPerWindow?: number;
   shutdownGraceMs?: number;
+  /** Per-client outbound queue cap in frames (default MONITOR_CLIENT_QUEUE_MAX_MESSAGES). */
+  clientQueueMaxMessages?: number;
+  /** Per-client outbound queue cap in bytes (default MONITOR_CLIENT_QUEUE_MAX_BYTES). */
+  clientQueueMaxBytes?: number;
 }
 
 class ClientOutboundQueue {
@@ -120,6 +124,8 @@ export function startMonitorServer(
     rateWindowMs: options.rateWindowMs ?? MONITOR_RATE_WINDOW_MS,
     maxFramesPerWindow: options.maxFramesPerWindow ?? MONITOR_MAX_FRAMES_PER_WINDOW,
     shutdownGraceMs: options.shutdownGraceMs ?? MONITOR_SHUTDOWN_GRACE_MS,
+    clientQueueMaxMessages: options.clientQueueMaxMessages ?? MONITOR_CLIENT_QUEUE_MAX_MESSAGES,
+    clientQueueMaxBytes: options.clientQueueMaxBytes ?? MONITOR_CLIENT_QUEUE_MAX_BYTES,
   };
   let globalCommands = 0;
   let admittedConnections = 0;
@@ -161,9 +167,14 @@ export function startMonitorServer(
       };
       return walk(value) as T;
     };
-    const outbound = new ClientOutboundQueue(socket, () => {
-      if (authToken) snapshotRequiredTokens.add(authToken);
-    });
+    const outbound = new ClientOutboundQueue(
+      socket,
+      () => {
+        if (authToken) snapshotRequiredTokens.add(authToken);
+      },
+      limits.clientQueueMaxMessages,
+      limits.clientQueueMaxBytes,
+    );
     const send = (value: unknown): boolean => outbound.send(visible(value));
     const terminate = (error: string): void => {
       send({ error });
