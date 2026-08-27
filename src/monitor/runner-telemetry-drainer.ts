@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import type Database from 'better-sqlite3';
 import type { MonitorEventType } from './protocol.js';
+import type { ProgressCoalescer } from './publisher.js';
 
 export interface RunnerTelemetryRow {
   id: string;
@@ -49,8 +50,9 @@ export function drainRunnerTelemetry(
            FROM runner_telemetry WHERE seq > ? ORDER BY seq ASC`,
       )
       .all(cursor) as RunnerTelemetryRow[];
-  } catch {
-    return cursor; // older session DB: no telemetry table yet
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('no such table: runner_telemetry')) return cursor;
+    throw error;
   }
   for (const row of rows) {
     sink({
@@ -66,6 +68,29 @@ export function drainRunnerTelemetry(
     highWater.set(sessionId, cursor);
   }
   return cursor;
+}
+
+/** Route durable runner rows through the same production coalescer as host telemetry. */
+export function drainRunnerTelemetryThroughCoalescer(
+  db: Database.Database,
+  sessionId: string,
+  agentGroupId: string,
+  highWater: TelemetryHighWater,
+  coalescer: ProgressCoalescer,
+): number {
+  return drainRunnerTelemetry(db, sessionId, highWater, (row) => {
+    coalescer.push(
+      row.type,
+      agentGroupId,
+      {
+        ...row.payload,
+        provenance: row.provenance,
+        occurredAt: row.occurredAt,
+        schemaVersion: row.schemaVersion,
+      },
+      { eventId: row.id, sessionId },
+    );
+  });
 }
 
 export class MemoryTelemetryHighWater implements TelemetryHighWater {
@@ -84,8 +109,15 @@ export class FileTelemetryHighWater implements TelemetryHighWater {
   constructor(private readonly file: string) {
     try {
       this.values = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, number>;
-    } catch {
-      this.values = {};
+    } catch (error) {
+      if (
+        error instanceof SyntaxError ||
+        (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT')
+      ) {
+        this.values = {};
+      } else {
+        throw error;
+      }
     }
   }
   get(sessionId: string): number {
