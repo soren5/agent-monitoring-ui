@@ -14,7 +14,7 @@ import { MonitorPublisher, ProgressCoalescer } from './publisher.js';
 import { startMonitorServer, type MonitorAuth, type MonitorGrants } from './transport.js';
 import { setRuntimeTelemetrySink } from './telemetry.js';
 import { createHostMessageDelivery } from './host-delivery.js';
-import { drainRunnerTelemetry, FileTelemetryHighWater } from './runner-telemetry-drainer.js';
+import { drainRunnerTelemetryThroughCoalescer, FileTelemetryHighWater } from './runner-telemetry-drainer.js';
 
 export const DEFAULT_MONITOR_SOCKET = path.join(DATA_DIR, 'monitor.sock');
 export const DEFAULT_MONITOR_TOKEN_FILE = path.join(DATA_DIR, 'monitor.token');
@@ -130,19 +130,14 @@ export async function startMonitorRuntime(
         continue;
       }
       try {
-        drainRunnerTelemetry(db, session.id, telemetryHighWater, (row) => {
-          monitorPublisher.publish(
-            row.type,
+        if (progressCoalescer)
+          drainRunnerTelemetryThroughCoalescer(
+            db,
+            session.id,
             session.agent_group_id,
-            {
-              ...row.payload,
-              provenance: row.provenance,
-              occurredAt: row.occurredAt,
-              schemaVersion: row.schemaVersion,
-            },
-            { eventId: row.id, sessionId: session.id },
+            telemetryHighWater,
+            progressCoalescer,
           );
-        });
       } catch (err) {
         if (!isTelemetryDbOperationalError(err)) throw err;
         log.warn('Runner telemetry drain failed', { sessionId: session.id, err });
