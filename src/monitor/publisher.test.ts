@@ -111,6 +111,26 @@ describe('publisher', () => {
     expect((seen[2] as { coalescedCount: number }).coalescedCount).toBe(2);
     vi.useRealTimers();
   });
+  it('keeps the latest provenance on coalesced progress and orders it before critical events', () => {
+    vi.useFakeTimers();
+    const p = new MonitorPublisher();
+    const seen: Array<Record<string, unknown>> = [];
+    p.on('event', (event) => seen.push(event as unknown as Record<string, unknown>));
+    const c = new ProgressCoalescer(p, 5000);
+    c.push('tool.progress', 'g', { n: 1 }, { eventId: 'runner-1', sessionId: 'session-1' });
+    c.push('tool.progress', 'g', { n: 2 }, { eventId: 'runner-2', sessionId: 'session-1' });
+    c.push('error', 'g', { message: 'failed' }, { eventId: 'runner-3', sessionId: 'session-1' });
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toMatchObject({
+      type: 'tool.progress',
+      eventId: 'runner-2',
+      sessionId: 'session-1',
+      coalescedCount: 2,
+      payload: { n: 2 },
+    });
+    expect(seen[1]).toMatchObject({ type: 'error', eventId: 'runner-3', sessionId: 'session-1' });
+    vi.useRealTimers();
+  });
   it('never classifies status, command, chat, errors, or terminal tools as droppable', () => {
     for (const type of [
       'agent.status',
