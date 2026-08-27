@@ -111,14 +111,9 @@ describe('local monitor transport', () => {
     expect(response).toContain('forbidden');
   });
 
-  // Platform note: evicting a paused client while a healthy client receives
-  // every event in the same burst is fundamentally timing-sensitive. macOS
-  // auto-tunes the TCP send buffer to absorb the paused peer's writes, so its
-  // backpressure (and the healthy peer's drain contention) varies by machine.
-  // The transport's queue-cap eviction is exercised by the other tests; this
-  // combined assertion is deterministic only on bounded-buffer platforms, so
-  // it is skipped on darwin.
-  const isDarwin = process.platform === 'darwin';
+  // A controlled server-socket high-water mark avoids platform send-buffer
+  // autotuning hiding backpressure while preserving production queue caps.
+  const isDarwin = false;
   it.skipIf(isDarwin)(
     'evicts an overflowing paused client while a healthy client receives every critical event in order',
     async () => {
@@ -128,7 +123,11 @@ describe('local monitor transport', () => {
       // backlog exceeds the cap and it is destroyed, while the draining healthy
       // peer flushes each frame (yielded below) and stays well under the cap.
       // This is deterministic regardless of OS socket buffer sizes.
-      await listeningServer(sock, publisher, { clientQueueMaxMessages: 64 });
+      await listeningServer(sock, publisher, {
+        clientQueueMaxMessages: 64,
+        socketWritableHighWaterMark: 1_024,
+        maxConnections: 2,
+      });
       const slow = net.createConnection(sock);
       slow.write(JSON.stringify({ token: 'ok' }) + '\n');
       await new Promise<void>((resolve) => slow.once('data', () => resolve()));
@@ -145,7 +144,7 @@ describe('local monitor transport', () => {
 
       const total = 100;
       for (let index = 0; index < total; index++) {
-        publisher.publish('chat.out', 'g', { index, payload: 'small' });
+        publisher.publish('chat.out', 'g', { index, payload: 'x'.repeat(60_000) });
         // Yield every frame so the draining healthy peer flushes before the next
         // publish; the paused peer never drains and its backlog exceeds the cap.
         await new Promise<void>((resolve) => setImmediate(resolve));
