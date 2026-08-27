@@ -37,6 +37,8 @@ export interface MonitorTransportOptions {
   clientQueueMaxMessages?: number;
   /** Per-client outbound queue cap in bytes (default MONITOR_CLIENT_QUEUE_MAX_BYTES). */
   clientQueueMaxBytes?: number;
+  /** Writable high-water mark for accepted sockets; primarily useful for deterministic pressure tests. */
+  socketWritableHighWaterMark?: number;
 }
 
 class ClientOutboundQueue {
@@ -129,7 +131,11 @@ export function startMonitorServer(
   };
   let globalCommands = 0;
   let admittedConnections = 0;
-  const server = net.createServer((socket) => {
+  const server = net.createServer(
+    options.socketWritableHighWaterMark === undefined
+      ? {}
+      : { highWaterMark: options.socketWritableHighWaterMark },
+    (socket) => {
     if (admittedConnections >= limits.maxConnections) {
       clients.add(socket);
       socket.once('close', () => clients.delete(socket));
@@ -259,7 +265,8 @@ export function startMonitorServer(
       publisher.off('event', onEvent);
     });
     socket.on('error', () => socket.destroy());
-  });
+    },
+  );
   const originalClose = server.close.bind(server);
   server.close = ((callback?: (err?: Error) => void) => {
     // Stop accepting immediately, then allow already-written frames a short
