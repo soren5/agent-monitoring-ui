@@ -25,6 +25,13 @@ const NEVER_DROP = new Set<MonitorEventType>([
 export type ResumeResult =
   | { kind: 'events'; events: MonitorEvent[] }
   | { kind: 'snapshot'; snapshot: MonitorSnapshot; reason: 'initial' | 'gap' | 'obsolete_epoch' };
+export interface MonitorEventProvenance {
+  runtimeId?: string;
+  sessionId?: string;
+  commandId?: string;
+  eventId?: string;
+  coalescedCount?: number;
+}
 
 export class MonitorPublisher extends EventEmitter {
   readonly streamId = randomUUID();
@@ -53,13 +60,7 @@ export class MonitorPublisher extends EventEmitter {
     type: MonitorEventType,
     agentGroupId: string | undefined,
     payload: Record<string, unknown>,
-    provenance: {
-      runtimeId?: string;
-      sessionId?: string;
-      commandId?: string;
-      eventId?: string;
-      coalescedCount?: number;
-    } = {},
+    provenance: MonitorEventProvenance = {},
   ): MonitorEvent {
     const eventId = provenance.eventId ?? randomUUID();
     const duplicate = this.eventsById.get(eventId);
@@ -199,6 +200,7 @@ export class ProgressCoalescer {
       type: MonitorEventType;
       agentGroupId: string | undefined;
       payload: Record<string, unknown>;
+      provenance: MonitorEventProvenance;
       count: number;
       timer: NodeJS.Timeout;
     }
@@ -211,21 +213,30 @@ export class ProgressCoalescer {
     type: MonitorEventType,
     agentGroupId: string | undefined,
     payload: Record<string, unknown>,
+    provenance: MonitorEventProvenance = {},
   ): MonitorEvent | undefined {
     if (!MonitorPublisher.isDroppable(type)) {
       // A critical event bypasses the delay, not the stream order: publish any
       // older progress first, then the critical event immediately.
       this.flush();
-      return this.publisher.publish(type, agentGroupId, payload);
+      return this.publisher.publish(type, agentGroupId, payload, provenance);
     }
-    const key = `${type}:${agentGroupId ?? ''}`;
+    const key = `${type}:${agentGroupId ?? ''}:${provenance.sessionId ?? ''}`;
     const prior = this.pending.get(key);
     if (prior) {
       prior.payload = payload;
+      prior.provenance = provenance;
       prior.count++;
       return;
     }
-    const item = { type, agentGroupId, payload, count: 1, timer: setTimeout(() => this.flush(key), this.maxDelayMs) };
+    const item = {
+      type,
+      agentGroupId,
+      payload,
+      provenance,
+      count: 1,
+      timer: setTimeout(() => this.flush(key), this.maxDelayMs),
+    };
     this.pending.set(key, item);
     return;
   }
@@ -235,7 +246,10 @@ export class ProgressCoalescer {
       if (!item) continue;
       clearTimeout(item.timer);
       this.pending.delete(k);
-      this.publisher.publish(item.type, item.agentGroupId, item.payload, { coalescedCount: item.count });
+      this.publisher.publish(item.type, item.agentGroupId, item.payload, {
+        ...item.provenance,
+        coalescedCount: item.count,
+      });
     }
   }
   close(): void {
